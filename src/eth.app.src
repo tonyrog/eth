@@ -1,0 +1,8 @@
+{application, eth,
+ [{description, "Ethernet device controller"},
+  {vsn, git},
+  {mod, {eth_app, []}},
+  {registered, [eth_srv]},
+  {env, []},
+  {applications,[kernel,stdlib]}
+  ]}.
