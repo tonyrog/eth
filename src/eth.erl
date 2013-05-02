@@ -12,7 +12,7 @@
 
 %% API
 -export([start_link/0]).
--export([bind/2, unbind/1, active/2]).
+-export([bind/2, unbind/1, active/2, setf/2]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
@@ -24,6 +24,7 @@
 -define(CMD_BIND,    1).
 -define(CMD_UNBIND,  2).
 -define(CMD_ACTIVE,  3).
+-define(CMD_SETF,    4).
 
 -record(state, 
 	{
@@ -52,6 +53,11 @@ unbind(Pid) ->
 
 active(Pid, N) when N >= -1 ->
     gen_server:call(Pid, {active, N}).
+
+setf(Pid, Filter) when is_list(Filter) ->
+    BinFilter = eth_bpf:encode(Filter),
+    gen_server:call(Pid, {setf, BinFilter}).
+
 
 %%%===================================================================
 %%% gen_server callbacks
@@ -90,13 +96,16 @@ init([]) ->
 %% @end
 %%--------------------------------------------------------------------
 handle_call({bind,Name}, _From, State) ->
-    Reply = call(State#state.port, ?CMD_BIND, [Name]),
+    Reply = call(State#state.port, ?CMD_BIND, Name),
     {reply, Reply, State};
 handle_call(unbind, _From, State) ->
     Reply = call(State#state.port, ?CMD_UNBIND, []),
     {reply, Reply, State};
 handle_call({active,N}, _From, State) ->
-    Reply = call(State#state.port, ?CMD_ACTIVE, [<<N:32/signed-integer>>]),
+    Reply = call(State#state.port, ?CMD_ACTIVE, <<N:32/signed-integer>>),
+    {reply, Reply, State};
+handle_call({setf,BinFilter}, _From, State) ->
+    Reply = call(State#state.port, ?CMD_SETF, BinFilter),
     {reply, Reply, State};
 handle_call(_Request, _From, State) ->
     Reply = {error,bad_call},

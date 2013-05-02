@@ -1,7 +1,6 @@
 //
 // eth_drv.c
 //
-// usage: sed 's/eth/foo/g' template_drv.c > foo_drv.c
 //
 
 #include <stdio.h>
@@ -17,6 +16,7 @@
 #include <arpa/inet.h>
 #include <net/if.h>
 #include <sys/ioctl.h>
+#include <linux/filter.h>
 #elif defined(__APPLE__)
 #include <fcntl.h>
 #include <sys/socket.h>
@@ -60,6 +60,7 @@ typedef struct _eth_ctx_t
 #define CMD_BIND   1
 #define CMD_UNBIND 2
 #define CMD_ACTIVE 3
+#define CMD_SETF   4
 
 static inline uint32_t get_uint32(uint8_t* ptr)
 {
@@ -319,6 +320,62 @@ static int setup_input_buffer(eth_ctx_t* ctx)
 #endif
 }
 
+static int set_bpf(eth_ctx_t* ctx, uint8_t* buf, int len)
+{
+#if defined(__linux__)
+#if 0
+    struct sock_fprog fcode;
+    struct sock_filter* insns = (struct sock_filter*) buf;
+    uint8_t* ptr = buf;
+    int n = len >> 3;
+    int i;
+    for (i = 0; i < n; i++) {
+        // inline convert to host endian
+	insns[i].code = get_uint16(ptr);
+	insns[i].k    = get_uint32(ptr+4);
+	DEBUGF("instruction: %d  code=%04x,jt=%d,jf=%d,k=%d",
+	       i, insns[i].code, insns[i].jt, insns[i].jf,
+	       insns[i].k);
+	ptr += 8;
+    }
+    fcode.len = n;
+    fcode.filter = insns;
+    if (setsockopt(INT_EVENT(ctx->fd), SOL_SOCKET, SO_ATTACH_FILTER,
+		   &fcode, sizeof(fcode)) == -1) {
+        DEBUGF("setsockopt error=%s", strerror(errno));
+        return -1;
+    }
+    return 0;
+#endif
+    errno = EINVAL;
+    retur -1;
+#elif defined(__APPLE__)
+    struct bpf_program prog;
+    struct bpf_insn*   insns = (struct bpf_insn*) buf;
+    uint8_t* ptr = buf;
+    int n = len >> 3;
+    int i;
+    for (i = 0; i < n; i++) {
+        // inline convert to host endian
+	insns[i].code = get_uint16(ptr);
+	insns[i].k    = get_uint32(ptr+4);
+	DEBUGF("instruction: %d  code=%04x,jt=%d,jf=%d,k=%d",
+	       i, insns[i].code, insns[i].jt, insns[i].jf,
+	       insns[i].k);
+	ptr += 8;
+    }
+    prog.bf_len = n;
+    prog.bf_insns = insns;
+    if (ioctl(INT_EVENT(ctx->fd), BIOCSETF, &prog) < 0) {
+	ERRORF("ioctl BIOCSETF %s", strerror(errno));
+	return -1;
+    }
+    return 0;
+#else
+    errno = EINVAL;
+    retur -1;
+#endif
+}
 
 static int bind_interface(eth_ctx_t* ctx)
 {
@@ -579,6 +636,13 @@ static ErlDrvSSizeT eth_drv_ctl(ErlDrvData d,
 	    }
 	}
 	goto ok;
+    case CMD_SETF: {  // N*<<code:16,jt:8,jl:8,k:32>>
+	if ((len & 7) != 0) goto badarg;  // must be multiple of 8
+	if (set_bpf(ctx, buf, len) < 0)
+	    goto error;
+	goto ok;
+    }
+	
     default:
 	goto badarg;
     }
