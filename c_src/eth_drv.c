@@ -10,13 +10,21 @@
 #include <unistd.h>
 #include <errno.h>
 
-#ifdef __linux__
+#if defined(__linux__)
 #include <sys/socket.h>
 #include <netpacket/packet.h>
 #include <net/ethernet.h>
 #include <arpa/inet.h>
 #include <net/if.h>
 #include <sys/ioctl.h>
+#elif defined(__APPLE__)
+#include <fcntl.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <sys/time.h>
+#include <sys/ioctl.h>
+#include <net/if.h>
+#include <net/bpf.h>
 #endif
 
 #include "erl_driver.h"
@@ -45,6 +53,8 @@ typedef struct _eth_ctx_t
     int         active;        // number of packets remain to process
     ErlDrvTermData dport;
     ErlDrvTermData target;
+    void*          ibuf;
+    size_t         ibuflen;
 } eth_ctx_t;
 
 #define CMD_BIND   1
@@ -226,17 +236,45 @@ static ErlDrvSSizeT ctl_reply(int rep, char* buf, ErlDrvSizeT len,
     return len+1;
 }
 
+static int open_device()
+{
+#if defined(__linux__)
+    // could select ETH_P_ARP/ETH_P_8021Q ...
+    return socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
+#elif defined(__APPLE__)
+    int i;
+    for (i = 0; i < 255; i++) {
+	int fd;
+	char bpfname[32];
+	sprintf(bpfname, "/dev/bpf%d", i);
+	if ((fd = open(bpfname, O_RDWR)) >= 0) {
+	    DEBUGF("/dev/bpf%d is opened for read and write", i);
+	    return fd;
+	}
+	else if (errno != EBUSY)
+	    return -1;
+    }
+    errno = ENOENT;
+    return -1;
+#else
+    errno = ENOENT;
+    return -1;
+#endif
+}
 //
 // attach socket to interface
 //
 static int get_ifindex(int fd, const uint8_t* ifname, size_t len)
 {
+#if defined(__linux__)
     struct ifreq ifr;
     int    index;
 
+    if (len >= sizeof(ifr.ifr_name)) {
+	errno = EINVAL;
+	return -1;
+    }
     memset(&ifr, 0, sizeof(ifr));
-    if (len >= sizeof(ifr.ifr_name))
-	len = sizeof(ifr.ifr_name)-1;
     memcpy(ifr.ifr_name, ifname, len);
     
     if (ioctl(fd, SIOCGIFINDEX, &ifr) < 0) {
@@ -246,34 +284,100 @@ static int get_ifindex(int fd, const uint8_t* ifname, size_t len)
     index = ifr.ifr_ifindex;
     DEBUGF("device %s has index %d", ifr.ifr_name, index);
     return index;
+#elif defined(__APPLE__)
+    // not used with bpf
+    return 0;
+#else
+    return -1;
+#endif
 }
 
-static int add_membership(eth_ctx_t* ctx)
+static int setup_input_buffer(eth_ctx_t* ctx)
 {
+#if defined(__linux__)
+    ctx->ibuf = driver_alloc(2048);
+    ctx->ibuflen = 2048;
+    return 0;
+#elif defined(__APPLE__)
+    u_int immediate = 1;
+    u_int buflen = 64*1024;
+
+    if (ioctl(INT_EVENT(ctx->fd), BIOCSBLEN, &buflen) < 0) {
+	ERRORF("ioctl BIOCSBLEN %s", strerror(errno));
+	return -1;
+    }
+    DEBUGF("buflen used = %d", buflen);
+    if (ioctl(INT_EVENT(ctx->fd), BIOCIMMEDIATE, &immediate) < 0) {
+	ERRORF("ioctl BIOCIMMEDIATE %s", strerror(errno));
+	return -1;
+    }
+    ctx->ibuf = driver_alloc(buflen);
+    ctx->ibuflen = buflen;
+    return 0;
+#else
+    return -1;
+#endif
+}
+
+
+static int bind_interface(eth_ctx_t* ctx)
+{
+#if defined(__linux__)
     struct packet_mreq mr;
     socklen_t mrlen = sizeof(mr);
     mr.mr_ifindex = ctx->if_index;
     mr.mr_type    = PACKET_MR_PROMISC;
     if (setsockopt(INT_EVENT(ctx->fd), SOL_PACKET, PACKET_ADD_MEMBERSHIP, 
 		   &mr, mrlen) < 0) {
-	ERRORF("ioctl error=%s", strerror(errno));
+	ERRORF("setsockopt PACKET_ADD_MEMBERSHIP error=%s", strerror(errno));
 	return -1;
     }
     return 0;
+#elif defined(__APPLE__)
+    struct ifreq ifr;
+    int    len = strlen(ctx->if_name);
+    u_int promisc = 1;
+    u_int flush = 1;
+
+    memset(&ifr, 0, sizeof(ifr));
+    memcpy(ifr.ifr_name, ctx->if_name, len);
+    if (ioctl(INT_EVENT(ctx->fd), BIOCSETIF, &ifr) < 0) {
+	ERRORF("ioctl BIOCSETIF error=%s", strerror(errno));
+	return -1;
+    }
+    if (ioctl(INT_EVENT(ctx->fd), BIOCPROMISC, &promisc) < 0) {
+	ERRORF("ioctl BIOCPROMISC error=%s", strerror(errno));
+	return -1;
+    }
+    if (ioctl(INT_EVENT(ctx->fd), BIOCFLUSH, &flush) < 0) {
+	ERRORF("ioctl BIOCFLUSH error=%s", strerror(errno));
+	return -1;
+    }
+    return 0;
+#else
+    return -1;
+#endif
 }
 
-static int drop_membership(eth_ctx_t* ctx)
+static int unbind_interface(eth_ctx_t* ctx)
 {
+#if defined(__linux__)
     struct packet_mreq mr;
     socklen_t mrlen = sizeof(mr);
     mr.mr_ifindex = ctx->if_index;
     mr.mr_type    = PACKET_MR_PROMISC;
     if (setsockopt(INT_EVENT(ctx->fd), SOL_PACKET, PACKET_DROP_MEMBERSHIP, 
 		   &mr, mrlen) < 0) {
-	ERRORF("ioctl error=%s", strerror(errno));
+	ERRORF("setsockopt PACKET_DROP_MEMBERSHIP error=%s", strerror(errno));
 	return -1;
     }
     return 0;
+#elif defined(__APPLE__)
+    // not possible with bpf ? (nor needed?)
+    return 0;
+#else
+    return -1;
+#endif
 }
 
 //
@@ -296,9 +400,9 @@ static void make_arp_packet(eth_ctx_t* ctx)
 
 static int input_frame(eth_ctx_t* ctx)
 {
-    char buffer[2048];
+#if defined(__linux__)
     int n;
-    if ((n = recvfrom(INT_EVENT(ctx->fd), buffer, 2048, 0, NULL, NULL)) > 0) {
+    if ((n = recvfrom(INT_EVENT(ctx->fd), ctx->ibuf, ctx->ibuflen, 0, NULL, NULL)) > 0) {
 	ErlDrvTermData message[16];
 	int i = 0;
 	DEBUGF("input_frame %d bytes", n);
@@ -306,14 +410,53 @@ static int input_frame(eth_ctx_t* ctx)
 	push_atom(ATOM(eth_frame));
 	push_port(ctx->dport);
 	push_int(ctx->if_index);
-	push_bin(buffer, n);
+	push_bin((char*)ctx->ibuf, n);
 	push_tuple(4);
 	driver_send_term(ctx->port, ctx->target, message, i);
+	if (ctx->active > 0)
+	    ctx->active--;
     }
     else if (n < 0) {
-	DEBUGF("input_frame failed %s", strerror(errno));
+	DEBUGF("input_frame recvfrom failed %s", strerror(errno));
     }
     return n;
+#elif defined(__APPLE__)
+    int n;
+    if ((n = read(INT_EVENT(ctx->fd), ctx->ibuf, ctx->ibuflen)) > 0) {
+	char* ptr = (char*) ctx->ibuf;
+	char* ptr_end = ptr + n;
+	while (ptr < ptr_end) {
+	    struct bpf_hdr* p = (struct bpf_hdr*)  ptr;
+	    char* data = ptr + p->bh_hdrlen;
+
+	    DEBUGF("input_frame %d bytes of %d remain=%d n=%d",
+		   p->bh_caplen, p->bh_datalen,
+		   ptr_end - data, n);
+	    
+	    if ((p->bh_caplen == p->bh_datalen) &&
+		(data+p->bh_caplen <= ptr_end)) {
+		ErlDrvTermData message[16];
+		int i = 0;
+		// {eth_frame, <port>, <index>, <data>}
+		push_atom(ATOM(eth_frame));
+		push_port(ctx->dport);
+		push_int(ctx->if_index);
+		push_bin(data, p->bh_caplen);
+		push_tuple(4);
+		driver_send_term(ctx->port, ctx->target, message, i);
+		if (ctx->active > 0)
+		    ctx->active--;
+	    }
+	    ptr = ptr + BPF_WORDALIGN(p->bh_hdrlen + p->bh_caplen);
+	}
+    }
+    else if (n < 0) {
+	DEBUGF("input_frame read failed %s", strerror(errno));
+    }
+    return n;
+#else
+    return -1;
+#endif
 }
 
 // setup global object area
@@ -341,8 +484,7 @@ static ErlDrvData eth_drv_start(ErlDrvPort port, char* command)
     eth_ctx_t* ctx;
     int fd;
 
-    // could select ETH_P_ARP/ETH_P_8021Q ...
-    if ((fd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL))) < 0)
+    if ((fd = open_device()) < 0)
 	return ERL_DRV_ERROR_ERRNO;
 
     if ((ctx = (eth_ctx_t*) 
@@ -360,6 +502,11 @@ static ErlDrvData eth_drv_start(ErlDrvPort port, char* command)
     ctx->if_name      = NULL;
     ctx->is_selecting = 0;
     ctx->active       = 0;
+
+    if (setup_input_buffer(ctx) < 0) {
+	// fixme: cleanup
+	return ERL_DRV_ERROR_ERRNO;
+    }
     
 #ifdef PORT_CONTROL_BINARY
     set_port_control_flags(port, PORT_CONTROL_FLAG_BINARY);
@@ -398,15 +545,14 @@ static ErlDrvSSizeT eth_drv_ctl(ErlDrvData d,
 	ctx->if_name = driver_alloc(len+1);
 	memcpy(ctx->if_name, buf, len);
 	ctx->if_name[len] = '\0';
-	// FIXME: add_membership or bind (support old linux?)
-	if (add_membership(ctx) < 0)
+	if (bind_interface(ctx) < 0)
 	    goto error;
 	goto ok;
 
     case CMD_UNBIND:
 	if (len != 0) goto badarg;
 	if (ctx->if_index >= 0) {
-	    if (drop_membership(ctx) < 0)
+	    if (unbind_interface(ctx) < 0)
 		goto error;
 	    ctx->if_index = -1;
 	    if (ctx->is_selecting) {
@@ -485,12 +631,9 @@ static void eth_drv_ready_input(ErlDrvData d, ErlDrvEvent e)
     if (ctx->fd == e) {
 	if (input_frame(ctx) < 0)
 	    return;
-	if (ctx->active > 0) {
-	    ctx->active--;
-	    if (ctx->active == 0) {
-		driver_select(ctx->port, ctx->fd, ERL_DRV_READ, 0);
-		ctx->is_selecting = 0;
-	    }
+	if (ctx->active == 0) {
+	    driver_select(ctx->port, ctx->fd, ERL_DRV_READ, 0);
+	    ctx->is_selecting = 0;
 	}
     }
 }
@@ -521,7 +664,7 @@ DRIVER_INIT(eth_drv)
 {
     ErlDrvEntry* ptr = &eth_drv_entry;
 
-    DEBUGF("eth driver_init");
+    DEBUGF("eth DRIVER_INIT");
 
     ptr->driver_name = "eth_drv";
     ptr->init  = eth_drv_init;
