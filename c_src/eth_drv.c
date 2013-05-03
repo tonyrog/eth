@@ -302,7 +302,7 @@ static int setup_input_buffer(eth_ctx_t* ctx)
 {
 #if defined(__linux__)
     ctx->ibuf    = NULL;
-    ctx->ibuflen = 2048;
+    ctx->ibuflen = 64*1024;
     return 0;
 #elif defined(__APPLE__)
     u_int immediate = 1;
@@ -333,11 +333,14 @@ static int setup_input_buffer(eth_ctx_t* ctx)
 static int alloc_input_buffer(eth_ctx_t* ctx)
 {
     uint buflen;
-    
+#if defined(__APPLE__)
     if (ioctl(INT_EVENT(ctx->fd), BIOCGBLEN, &buflen) < 0) {
 	ERRORF("ioctl BIOCGBLEN %s", strerror(errno));
 	return -1;
     }
+#else
+    buflen = ctx->ibuflen;
+#endif
     DEBUGF("alloc_input_buffer: size=%d", buflen);
     ctx->ibuf = driver_alloc(buflen);
     ctx->ibuflen = buflen;
@@ -348,7 +351,6 @@ static int alloc_input_buffer(eth_ctx_t* ctx)
 static int set_bpf(eth_ctx_t* ctx, uint8_t* buf, int len)
 {
 #if defined(__linux__)
-#if 0
     struct sock_fprog fcode;
     struct sock_filter* insns = (struct sock_filter*) buf;
     uint8_t* ptr = buf;
@@ -371,9 +373,6 @@ static int set_bpf(eth_ctx_t* ctx, uint8_t* buf, int len)
         return -1;
     }
     return 0;
-#endif
-    errno = EINVAL;
-    retur -1;
 #elif defined(__APPLE__)
     struct bpf_program prog;
     struct bpf_insn*   insns = (struct bpf_insn*) buf;
@@ -484,7 +483,7 @@ static int input_frame(eth_ctx_t* ctx)
 {
 #if defined(__linux__)
     int n;
-    if ((n = recvfrom(INT_EVENT(ctx->fd), ctx->ibuf, ctx->ibuflen, 0, NULL, NULL)) > 0) {
+    if ((n = read(INT_EVENT(ctx->fd), ctx->ibuf, ctx->ibuflen)) > 0) {
 	ErlDrvTermData message[16];
 	int i = 0;
 	DEBUGF("input_frame %d bytes", n);
@@ -571,9 +570,11 @@ static ErlDrvData eth_drv_start(ErlDrvPort port, char* command)
 
     if ((ctx = (eth_ctx_t*) 
 	 driver_alloc(sizeof(eth_ctx_t))) == NULL) {
+	close(fd);
 	errno = ENOMEM;
 	return ERL_DRV_ERROR_ERRNO;
     }
+    memset(ctx, 0, sizeof(eth_ctx_t));
     DEBUGF("eth_drv: start (%s) fd=%d", command, fd);
 
     ctx->port         = port;
@@ -581,12 +582,10 @@ static ErlDrvData eth_drv_start(ErlDrvPort port, char* command)
     ctx->target       = driver_caller(port);
     ctx->fd           = (ErlDrvEvent)fd;
     ctx->if_index     = -1;
-    ctx->if_name      = NULL;
-    ctx->is_selecting = 0;
-    ctx->active       = 0;
 
     if (setup_input_buffer(ctx) < 0) {
-	// fixme: cleanup
+	close(fd);
+	driver_free(ctx);
 	return ERL_DRV_ERROR_ERRNO;
     }
     

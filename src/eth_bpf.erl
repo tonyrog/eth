@@ -14,8 +14,15 @@
 -export([exec/2, exec/5]).
 
 %% debug/test
--export([run_is_rarp/1, is_rarp/0]).
--export([is_src_dst/0, is_src_dst/2, is_tcp_finger/0, is_host/1]).
+-export([is_ip/0,
+	 is_src_dst/2,
+	 is_rarp/0,
+	 is_arp/0,
+	 is_tcp/0,
+	 is_udp/0,
+	 is_dhcp/0,
+	 is_tcp_finger/0, 
+	 is_host/1]).
 
 encode(Bs) when is_list(Bs) ->
     list_to_binary([ encode_(B) || B <- Bs ]);
@@ -194,19 +201,19 @@ exec(Is,A,X,P,M) when is_binary(P), is_tuple(M) ->
 
 exec_([I=#bpf_insn{code=Code,k=K}|Is],A,X,P,M) ->
     case Code of
-	ldaw -> exec_(Is, load_(P,K, 32), X, P, M);
-	ldah -> exec_(Is, load_(P,K, 16), X, P, M);
-	ldab -> exec_(Is, load_(P,K, 8), X, P, M);
-	ldiw -> exec_(Is, load_(P,X+K, 32), X, P, M);
-	ldih -> exec_(Is, load_(P,X+K, 16), X, P, M);
-	ldib -> exec_(Is, load_(P,X+K, 8), X, P, M);
+	ldaw -> exec_(Is, load_(P,K,32), X, P, M);
+	ldah -> exec_(Is, load_(P,K,16), X, P, M);
+	ldab -> exec_(Is, load_(P,K,8), X, P, M);
+	ldiw -> exec_(Is, load_(P,X+K,32), X, P, M);
+	ldih -> exec_(Is, load_(P,X+K,16), X, P, M);
+	ldib -> exec_(Is, load_(P,X+K,8), X, P, M);
 	ldl  -> exec_(Is, byte_size(P), X, P, M);
 	ldc  -> exec_(Is, K, X, P, M);
 	ldm  -> exec_(Is, element(K+1,M), X, P, M);
 	ldxc  -> exec_(Is, A, K, P, M);
 	ldxm  -> exec_(Is, A, element(K+1,M), P, M);
 	ldxl  -> exec_(Is, A, byte_size(P), P, M);
-	ldxmsh -> exec_(Is, A, 4*(load_(P,K, 8) band 16#f), P, M);
+	ldxmsh -> exec_(Is, A, 4*(load_(P,K,8) band 16#f), P, M);
 	st -> exec_(Is, A, X, P, setelement(K+1,A,M));
 	stx -> exec_(Is, A, X, P, setelement(K+1,X,M));
 	addk -> exec_(Is, A + K, X, P, M);
@@ -257,65 +264,142 @@ load_(P, K, Size) ->
 %% Examples (remove soon)
 %%
 -define(ETHERTYPE_IP,     16#0800).
+-define(ETHERTYPE_IPV6,   16#86dd).
+-define(ETHERTYPE_ARP,    16#0806).
 -define(ETHERTYPE_REVARP, 16#8035).
 
--define(ARPOP_REVREQUEST, 3).
+-define(ARPOP_REQUEST,  1).	%% ARP request.
+-define(ARPOP_REPLY,    2).	%% ARP reply.
+-define(ARPOP_RREQUEST, 3).	%% RARP request.
+-define(ARPOP_RREPLY,   4).     %% RARP reply.
 
 -define(IPPROTO_TCP,  6).
 -define(IPPROTO_ICMP,  1).
 -define(IPPROTO_UDP,  17).
 
 is_rarp() ->
-    [#bpf_insn{code=ldah, k=12},
-     #bpf_insn{code=jeqk, k=?ETHERTYPE_REVARP, jt=0, jf=3 },
-     #bpf_insn{code=ldah, k=20},
-     #bpf_insn{code=jeqk, k=?ARPOP_REVREQUEST, jt=0, jf=1 },
-     #bpf_insn{code=retk, k=14+12 },
-     #bpf_insn{code=retk, k=0}].
+    if_rarp([return(-1)], [return(0)]).
 
-run_is_rarp(P) when is_binary(P) ->
-    exec(is_rarp(), P).
+is_arp() ->
+    if_arp([return(-1)], [return(0)]).
 
-is_src_dst() ->
-    is_src_dst(16#8003700f, 16#80037023).
+is_udp() ->
+    if_ip(if_udp([return(-1)],[return(0)]), [return(0)]).
 
-is_src_dst(Src, Dst) ->
-    [#bpf_insn{code=ldah, k=12},
-     #bpf_insn{code=jeqk, k=?ETHERTYPE_IP, jt=0, jf=8},
-     #bpf_insn{code=ldaw, k=26},
-     #bpf_insn{code=jeqk, k=Src, jt=0, jf=2},
-     #bpf_insn{code=ldaw, k=30},
-     #bpf_insn{code=jeqk, k=Dst, jt=3, jf=4},
-     #bpf_insn{code=jeqk, k=Dst, jt=0, jf=3},
-     #bpf_insn{code=ldaw, k=30},
-     #bpf_insn{code=jeqk, k=Src, jt=1, jf=1},
-     #bpf_insn{code=retk, k=16#ffffffff},
-     #bpf_insn{code=retk, k=0}].
+is_tcp() ->
+    if_ip(if_tcp([return(-1)],[return(0)]), [return(0)]).
 
-%% IP A.B.C.D must be src or dst
-is_host({A,B,C,D}) ->
-    IP = (A bsl 24) + (B bsl 16) + (C bsl 8) + D,
-    [#bpf_insn{code=ldah, k=12},
-     #bpf_insn{code=jeqk, k=?ETHERTYPE_IP, jt=0, jf=5},
-     #bpf_insn{code=ldaw, k=26},
-     #bpf_insn{code=jeqk, k=IP, jt=2, jf=0},
-     #bpf_insn{code=ldaw, k=30},
-     #bpf_insn{code=jeqk, k=IP, jt=0, jf=1},
-     #bpf_insn{code=retk, k=16#ffffffff},
-     #bpf_insn{code=retk, k=0}].
+is_ip() ->
+    if_ip([return(-1)], [return(0)]).    
     
 
+if_ip(True,False) ->
+    if_ethertype(?ETHERTYPE_IP, True, False).
+
+if_rarp(True,False) ->
+    if_ethertype(?ETHERTYPE_REVARP, True, False).
+
+if_arp(True,False) ->
+    if_ethertype(?ETHERTYPE_ARP, True, False).
+
+
+
+%%  Src -> Dst || Dst -> Src
+is_src_dst(Src, Dst) ->
+    if_ip(
+      if_ip_src(Src,
+		if_ip_dst(Dst, [return(-1)], [return(0)]),
+		if_ip_src(Dst, 
+			  if_ip_dst(Src, [return(-1)], [return(0)]),
+			  [return(0)])),
+      [return(0)]).
+
+%% IP ip.src == A.B.C.D  || ip.dst == A.B.C.D
+is_host({A,B,C,D}) ->
+    IP = (A bsl 24) + (B bsl 16) + (C bsl 8) + D,
+    if_ip(
+      if_ip_src(IP, [return(-1)], 
+		if_ip_dst(IP, [return(-1)], [return(0)])),
+      [return(0)]).
+
 is_tcp_finger() ->
-    [#bpf_insn{code=ldah, k=12},
-     #bpf_insn{code=jeqk, k=?ETHERTYPE_IP, jt=0, jf=10},
-     #bpf_insn{code=ldab, k=23 },
-     #bpf_insn{code=jeqk, k=?IPPROTO_TCP, jt=0, jf=8},
-     #bpf_insn{code=ldah, k=20 },
-     #bpf_insn{code=jsetk, k=16#1fff, jt=6, jf=0},
-     #bpf_insn{code=ldxbmsh, k=14 },
-     #bpf_insn{code=ldih, k=13 },
-     #bpf_insn{code=jeqk, k=79, jt=2, jf=0},
-     #bpf_insn{code=ldih, k=16 },
-     #bpf_insn{code=jeqk, k=79, jt=0, jf=1},
-     #bpf_insn{code=retk, k=16#ffffffff },
-     #bpf_insn{code=retk, k=0 }].
+    is_tcp_service(79).
+
+is_dhcp() ->
+    is_udp_service(67).
+
+is_udp_service(Port) ->
+    if_ip(
+      if_udp(
+	    if_ip_fragments([return(0)],[]) ++
+	    if_ip_src(Port, [return(0)], []) ++
+	    if_ip_dst(Port, [return(0)], []) ++
+	    [return(-1)],
+	[return(0)]),
+      [return(0)]).
+
+is_tcp_service(Port) ->
+    if_ip(
+      if_tcp(
+	    if_ip_fragments([return(0)],[]) ++
+	    if_ip_src(Port, [return(0)], []) ++
+	    if_ip_dst(Port, [return(0)], []) ++
+	    [return(-1)],
+	[return(0)]),
+      [return(0)]).
+    
+
+return(K) ->
+    #bpf_insn{code=retk, k=(K band 16#ffffffff) }.
+
+if_ethertype(Value, True, False) ->
+    [#bpf_insn{code=ldah, k=12} | if_eqk(Value, True, False)].
+
+if_arpop(Value, True, False) ->
+    [#bpf_insn{code=ldah, k=12+14} | if_eqk(Value, True, False)].
+
+if_ip_src(Value, True, False) ->
+    [#bpf_insn{code=ldaw, k=26} | if_eqk(Value, True, False)].
+
+if_ip_dst(Value, True, False) ->
+    [#bpf_insn{code=ldaw, k=30} | if_eqk(Value, True, False)].
+
+if_ip_fragments(True, False) ->
+    [ #bpf_insn{code=ldah, k=20 } | if_setk(16#1fff, True, False)].
+
+if_port_src(Value, True, False) ->
+    [ #bpf_insn{code=ldxbmsh, k=14 },  %% X = headerlen
+      #bpf_insn{code=ldih, k=14 } | if_eqk(Value, True, False)].
+
+if_port_dst(Value, True, False) ->
+    [ #bpf_insn{code=ldxbmsh, k=14 },  %% X = headerlen
+      #bpf_insn{code=ldih, k=16 } | if_eqk(Value, True, False)].
+    
+if_ip_protocol(Value, True, False) ->
+    [ #bpf_insn{code=ldab, k=23 } | if_eqk(Value, True, False) ].
+
+if_tcp(True, False) ->
+    if_ip_protocol(?IPPROTO_TCP, True, False).
+
+if_udp(True, False) ->
+    if_ip_protocol(?IPPROTO_UDP, True, False).
+
+if_eqk(K, True, False) ->
+    if_opk(jeqk, K, True, False).
+
+if_gtk(K, True, False) ->
+    if_opk(jgtk, K, True, False).
+
+if_gek(K, True, False) ->
+    if_opk(jgek, K, True, False).
+
+if_setk(K, True, False) ->
+    if_opk(jsetk, K, True, False).
+
+if_opk(Op, K, True, False) ->
+    LT = length(True),
+    LF = length(False),
+    [#bpf_insn{code=Op, k=K, jt=0, jf=LT+1 }] ++
+	True ++
+	[#bpf_insn{code=jmp,k=LF+1}] ++
+	False.
