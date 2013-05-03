@@ -61,6 +61,7 @@ typedef struct _eth_ctx_t
 #define CMD_UNBIND 2
 #define CMD_ACTIVE 3
 #define CMD_SETF   4
+#define CMD_DEBUG  5
 
 static inline uint32_t get_uint32(uint8_t* ptr)
 {
@@ -82,8 +83,12 @@ static inline uint16_t get_uint16(uint8_t* ptr)
 
 static inline uint8_t get_uint8(uint8_t* ptr)
 {
-    uint8_t value = (ptr[0]<<0);
-    return value;
+    return ptr[0];
+}
+
+static inline int8_t get_int8(uint8_t* ptr)
+{
+    return (int8_t) ptr[0];
 }
 
 static inline void put_uint16(uint8_t* ptr, uint16_t v)
@@ -296,29 +301,49 @@ static int get_ifindex(int fd, const uint8_t* ifname, size_t len)
 static int setup_input_buffer(eth_ctx_t* ctx)
 {
 #if defined(__linux__)
-    ctx->ibuf = driver_alloc(2048);
+    ctx->ibuf    = NULL;
     ctx->ibuflen = 2048;
     return 0;
 #elif defined(__APPLE__)
     u_int immediate = 1;
-    u_int buflen = 64*1024;
+    u_int buflen = 32*1024;
 
-    if (ioctl(INT_EVENT(ctx->fd), BIOCSBLEN, &buflen) < 0) {
-	ERRORF("ioctl BIOCSBLEN %s", strerror(errno));
-	return -1;
+    while(buflen > 0) {
+	if (ioctl(INT_EVENT(ctx->fd), BIOCSBLEN, &buflen) >= 0)
+	    break;
+	if (errno != ENOBUFS) {
+	    ERRORF("ioctl BIOCSBLEN %s", strerror(errno));
+	    return -1;
+	}
+	buflen >>= 1;
     }
     DEBUGF("buflen used = %d", buflen);
     if (ioctl(INT_EVENT(ctx->fd), BIOCIMMEDIATE, &immediate) < 0) {
 	ERRORF("ioctl BIOCIMMEDIATE %s", strerror(errno));
 	return -1;
     }
-    ctx->ibuf = driver_alloc(buflen);
+    ctx->ibuf    = NULL;
     ctx->ibuflen = buflen;
     return 0;
 #else
     return -1;
 #endif
 }
+
+static int alloc_input_buffer(eth_ctx_t* ctx)
+{
+    uint buflen;
+    
+    if (ioctl(INT_EVENT(ctx->fd), BIOCGBLEN, &buflen) < 0) {
+	ERRORF("ioctl BIOCGBLEN %s", strerror(errno));
+	return -1;
+    }
+    DEBUGF("alloc_input_buffer: size=%d", buflen);
+    ctx->ibuf = driver_alloc(buflen);
+    ctx->ibuflen = buflen;
+    return 0;
+}
+
 
 static int set_bpf(eth_ctx_t* ctx, uint8_t* buf, int len)
 {
@@ -504,7 +529,7 @@ static int input_frame(eth_ctx_t* ctx)
 		if (ctx->active > 0)
 		    ctx->active--;
 	    }
-	    ptr = ptr + BPF_WORDALIGN(p->bh_hdrlen + p->bh_caplen);
+	    ptr += BPF_WORDALIGN(p->bh_hdrlen + p->bh_caplen);
 	}
     }
     else if (n < 0) {
@@ -604,6 +629,8 @@ static ErlDrvSSizeT eth_drv_ctl(ErlDrvData d,
 	ctx->if_name[len] = '\0';
 	if (bind_interface(ctx) < 0)
 	    goto error;
+	if (alloc_input_buffer(ctx) < 0)
+	    goto error;
 	goto ok;
 
     case CMD_UNBIND:
@@ -619,7 +646,7 @@ static ErlDrvSSizeT eth_drv_ctl(ErlDrvData d,
 	}
 	goto ok;
 	    
-    case CMD_ACTIVE:  // <<n:32/signed>>
+    case CMD_ACTIVE: { // <<n:32/signed>>
 	if (len != 4) goto badarg;
 	if (ctx->if_index < 0) goto badarg;
 	ctx->active = get_int32(buf);
@@ -636,6 +663,8 @@ static ErlDrvSSizeT eth_drv_ctl(ErlDrvData d,
 	    }
 	}
 	goto ok;
+    }
+
     case CMD_SETF: {  // N*<<code:16,jt:8,jl:8,k:32>>
 	if ((len & 7) != 0) goto badarg;  // must be multiple of 8
 	if (set_bpf(ctx, buf, len) < 0)
@@ -643,6 +672,11 @@ static ErlDrvSSizeT eth_drv_ctl(ErlDrvData d,
 	goto ok;
     }
 	
+    case CMD_DEBUG: {
+	if (len != 1) goto badarg;
+	debug_level = get_int8(buf);
+	goto ok;
+    }
     default:
 	goto badarg;
     }
