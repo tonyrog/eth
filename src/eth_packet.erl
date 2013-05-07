@@ -95,6 +95,13 @@ fmt_json_value(I,R,F,D,N) ->
 	is_tuple(D), tuple_size(D) =:= 6, R =:= eth,
 	(F =:= src orelse F =:= dst) ->
 	    [?Q,ethtoa(D),?Q];
+
+	is_tuple(D), tuple_size(D) =:= 2, R =:= arp,
+	(F =:= sender orelse F =:= target) ->
+	%% R#arp.htype =:= ethernet, R#arp.ptype =:= ipv4 ->
+	    [$[,[?Q,ethtoa(element(1,D)),?Q],$,,
+	     [?Q,inet_parse:ntoa(element(2,D)),?Q],$]];
+
 	is_tuple(D) ->
 	    case is_pkt_record(D) of
 		true ->

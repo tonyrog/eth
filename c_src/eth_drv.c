@@ -486,14 +486,15 @@ static int input_frame(eth_ctx_t* ctx)
     if ((n = read(INT_EVENT(ctx->fd), ctx->ibuf, ctx->ibuflen)) > 0) {
 	ErlDrvTermData message[16];
 	int i = 0;
-	DEBUGF("input_frame %d bytes", n);
+	int j;
 	// {eth_frame, <port>, <index>, <data>}
 	push_atom(ATOM(eth_frame));
 	push_port(ctx->dport);
 	push_int(ctx->if_index);
 	push_bin((char*)ctx->ibuf, n);
 	push_tuple(4);
-	driver_send_term(ctx->port, ctx->target, message, i);
+	j = driver_send_term(ctx->port, ctx->target, message, i);
+	DEBUGF("input_frame %d bytes, %d words, %d status", n, i, j);
 	if (ctx->active > 0)
 	    ctx->active--;
     }
@@ -518,13 +519,15 @@ static int input_frame(eth_ctx_t* ctx)
 		(data+p->bh_caplen <= ptr_end)) {
 		ErlDrvTermData message[16];
 		int i = 0;
+		int j;
 		// {eth_frame, <port>, <index>, <data>}
 		push_atom(ATOM(eth_frame));
 		push_port(ctx->dport);
 		push_int(ctx->if_index);
 		push_bin(data, p->bh_caplen);
 		push_tuple(4);
-		driver_send_term(ctx->port, ctx->target, message, i);
+		j=driver_send_term(ctx->port, ctx->target, message, i);
+		DEBUGF("input_frame %d bytes, %d words, %d status", n, i, j);
 		if (ctx->active > 0)
 		    ctx->active--;
 	    }
@@ -656,6 +659,7 @@ static ErlDrvSSizeT eth_drv_ctl(ErlDrvData d,
 	    }
 	}
 	else { // enable
+	    ctx->target = driver_caller(ctx->port);
 	    if (!ctx->is_selecting) {
 		driver_select(ctx->port, ctx->fd, ERL_DRV_READ, 1);
 		ctx->is_selecting = 1;

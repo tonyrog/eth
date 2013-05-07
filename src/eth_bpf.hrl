@@ -86,6 +86,13 @@
 	  k    = 0 :: uint32_t()
 	}).
 
+-record(bpf_block,
+	{
+	  label = 0  :: uint32_t(),    %% could be anything
+	  insns = [] :: [#bpf_insn{}], %% non jump code
+	  next       :: #bpf_insn{}    %% jmp/ret instruction 
+	}).
+
 %% 
 %% Number of scratch memory words (for BPF_LD|BPF_MEM and BPF_ST).
 %%
