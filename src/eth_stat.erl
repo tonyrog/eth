@@ -16,9 +16,8 @@
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
 	 terminate/2, code_change/3]).
--export([active/2, clear/1, dump/1]).
 
--define(SERVER, ?MODULE). 
+-export([set_filter/2, set_active/2, clear/1, dump/1, stop/1]).
 
 -include_lib("enet/include/enet_types.hrl").
 
@@ -40,12 +39,29 @@
 %% @spec start_link() -> {ok, Pid} | ignore | {error, Error}
 %% @end
 %%--------------------------------------------------------------------
-start_link(E) ->
-    gen_server:start_link({local, ?SERVER}, ?MODULE, [E], []).
 
-active(Pid, N) ->
-    gen_server:call(Pid, {active, N}).
+start_link(Interface) when is_list(Interface) ->
+    gen_server:start_link(?MODULE, [Interface], []).
 
+
+%% stop statistics
+stop(Pid) ->
+    gen_server:call(Pid, stop).
+
+%% only do statistic on what match the filter!
+set_filter(Pid, Prog) when is_pid(Pid), is_tuple(Prog) ->
+    Filter = eth_bpf:encode(Prog),
+    gen_server:call(Pid, {set_filter, Filter}).
+
+%% controls how many packets that should be handled:
+%% -1 = unlimited
+%%  0 = off
+%%  N = count
+%%
+set_active(Pid, N) ->
+    gen_server:call(Pid, {set_active, N}).
+
+%% Dump statistics
 dump(Pid) ->
     {ok,{PacketCounters,DataCounters}} = gen_server:call(Pid, counters),
     dump(PacketCounters, DataCounters).
@@ -76,13 +92,17 @@ dump(PTab, DTab) ->
 %%                     {stop, Reason}
 %% @end
 %%--------------------------------------------------------------------
-init([E]) ->
-    link(E),
-    PacketCounters = ets:new(packet_counters, [ordered_set]),
-    DataCounters = ets:new(data_counters, [ordered_set]),
-    {ok, #state { eth = E,
-		  packet_counters = PacketCounters,
-		  data_counters = DataCounters }}.
+init([Interface]) ->
+    case eth_devices:open(Interface) of
+	{ok,Port} ->
+	    PacketCounters = ets:new(packet_counters, [ordered_set]),
+	    DataCounters = ets:new(data_counters, [ordered_set]),
+	    {ok, #state { eth = Port,
+			  packet_counters = PacketCounters,
+			  data_counters = DataCounters }};
+	Error ->
+	    {stop, Error}
+    end.
 
 %%--------------------------------------------------------------------
 %% @private
@@ -98,8 +118,11 @@ init([E]) ->
 %%                                   {stop, Reason, State}
 %% @end
 %%--------------------------------------------------------------------
-handle_call({active,N}, _From, State) ->
-    Reply = eth:active(State#state.eth, N),
+handle_call({set_active,N}, _From, State) ->
+    Reply = eth_devices:set_active(State#state.eth, N),
+    {reply, Reply, State};
+handle_call({set_filter,Filter}, _From, State) ->
+    Reply = eth_devices:set_filter(State#state.eth, Filter),
     {reply, Reply, State};
 handle_call(counters, _From, State) ->
     {reply, {ok, {State#state.packet_counters, State#state.data_counters}}, 
@@ -108,6 +131,8 @@ handle_call(clear, _From, State) ->
     ets:delete_all_objects(State#state.packet_counters),
     ets:delete_all_objects(State#state.data_counters),
     {reply, ok, State}; 
+handle_call(stop, _From, State) ->
+    {stop, normal, ok, State};
 handle_call(_Request, _From, State) ->
     Reply = {error,bad_call},
     {reply, Reply, State}.

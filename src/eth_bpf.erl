@@ -11,6 +11,7 @@
 
 -export([encode/1]).
 -export([decode/1]).
+-export([join/1]).
 -export([exec/2, exec/6]).
 
 %% bpf program utils
@@ -34,7 +35,11 @@
 
 -compile(export_all).
 
--import(lists, [reverse/1]).
+-import(lists, [reverse/1, foldl/3]).
+
+-define(MAX_OPTIMISE, 10).
+
+-define(uint32(X), ((X) band 16#ffffffff)).
 
 %% "compile" the program 
 encode(Prog) when is_tuple(Prog) ->
@@ -45,8 +50,8 @@ encode_(#bpf_insn{code=ldah,k=K}) -> insn(?BPF_LD+?BPF_H+?BPF_ABS,K);
 encode_(#bpf_insn{code=ldab,k=K}) -> insn(?BPF_LD+?BPF_B+?BPF_ABS, K);
 
 encode_(#bpf_insn{code=ldiw,k=K}) -> insn(?BPF_LD+?BPF_W+?BPF_IND,K);
-encode_(#bpf_insn{code=ldih,k=K}) -> insn(?BPF_LD+?BPF_H +?BPF_IND,K);
-encode_(#bpf_insn{code=ldib,k=K}) -> insn(?BPF_LD+?BPF_H+?BPF_IND,K);
+encode_(#bpf_insn{code=ldih,k=K}) -> insn(?BPF_LD+?BPF_H+?BPF_IND,K);
+encode_(#bpf_insn{code=ldib,k=K}) -> insn(?BPF_LD+?BPF_B+?BPF_IND,K);
 
 encode_(#bpf_insn{code=ldl })      -> insn(?BPF_LD + ?BPF_LEN);
 encode_(#bpf_insn{code=ldc, k=K})  -> insn(?BPF_LD + ?BPF_IMM, K);
@@ -153,7 +158,7 @@ decode_ldx_(Code, K) ->
     end.
 
 decode_st_(_Code, K) ->
-    #bpf_insn { code=st, k=K }.
+    #bpf_insn { code=sta, k=K }.
 
 decode_stx_(_Code, K) ->
     #bpf_insn { code=stx, k=K }.
@@ -198,6 +203,41 @@ alu_src_(Code, K, X) ->
 	?BPF_K -> K;
 	?BPF_X -> X
     end.
+
+%% Join encoded filters into one big filter
+join([]) ->
+    encode({reject()});
+join(Fs) -> 
+    join_(Fs, []).
+
+join_([F], Acc) ->
+    Prog = if F =:= <<>> -> {accept()};
+	      true -> decode(F)
+	   end,
+    Is = tuple_to_list(Prog),
+    Js = lists:flatten(reverse([Is | Acc])),
+    Prog1 = list_to_tuple(Js),
+    %% optimise ?
+    encode(Prog1);
+join_([F|Fs], Acc) ->
+    Prog = if F =:= <<>> -> {nop()};
+	      true -> decode(F)
+	   end,
+    Is = tuple_to_list(Prog),
+    %% translate:
+    %%  {ret,0} => {jmp,<next-filter>}
+    %% fixme translate:
+    %%  reta => jeqk 0 <next-filter> else <reta-label>
+    Js = join_rewrite_(Is, tuple_size(Prog)),
+    join_(Fs, [Js | Acc]).
+
+join_rewrite_([#bpf_insn {code=retk, k=0}|Is], N) ->
+    [#bpf_insn { code=jmp, k=N-1 } | join_rewrite_(Is, N-1)];
+join_rewrite_([I|Is], N) ->
+    [I | join_rewrite_(Is, N-1)];
+join_rewrite_([], _N) ->
+    [].
+
 
 class(I) ->
     K = I#bpf_insn.k,
@@ -252,46 +292,48 @@ class(I) ->
 	retk -> {ret,{k,K}};
 
 	tax ->  {misc,x,a};
-	txa ->  {misc,a,x};
-	dead -> {misc,dead,dead}
+	txa ->  {misc,a,x}
     end.
 
 %%
-%% Print BPF
+%% Print BPF  (style C/tcpdump)
 %%
-print_bs([B|Bs]) when is_record(B, bpf_block) ->
-    io:format("~w:\n", [B#bpf_block.label]),
-    lists:foreach(
-      fun(I) ->
-	      print_insn("    ", -1, I)
-      end, B#bpf_block.insns),
-    print_insn("    ", -1, B#bpf_block.next),
-    print_bs(Bs);
-print_bs([]) ->
-    ok.
-    
-    
+
+print_bs(Bs) when is_record(Bs,bpf_bs) ->
+    bs_each_block(
+      fun(B) ->
+	      io:format("L~w:\n", [B#bpf_block.label]),
+	      lists:foreach(
+		fun(I) ->
+			print_insn_c("    ", -1, I)
+		end, B#bpf_block.insns),
+	      print_insn_c("    ", -1, B#bpf_block.next)
+      end, Bs),
+    Bs.
+
 print(Prog) when is_tuple(Prog) ->
-    print_(Prog, 1).
-    
-print_(Prog, J) when J >= 1, J =< tuple_size(Prog) ->
+    print_p(Prog, 0).
+
+%%
+%% Print in "C" format
+%%
+
+print_c(Prog, J) when J >= 1, J =< tuple_size(Prog) ->
     I = element(J,Prog),
     L = io_lib:format("~.3.0w: ", [J]),
-    print_insn(L, J, I),
-    print_(Prog, J+1);
-print_(Prog, _J) ->
+    print_insn_c(L, J, I),
+    print_c(Prog, J+1);
+print_c(Prog, _J) ->
     Prog.
 
-print_insn(L, J, I) ->
+print_insn_c(L, J, I) ->
     case class(I) of
 	{jmp,Cond,R} ->
-	    print_jmp_(Cond,R,I,L,J);
+	    print_jmp_c(Cond,R,I,L,J);
 	{ld,Dst,Src} ->
-	    print_ld_(Dst,Src,I,L);
+	    print_ld_c(Dst,Src,I,L);
 	_ ->
 	    case I of
-		#bpf_insn { code=dead } ->
-		    io:format("~sdead\n", [L]);
 		#bpf_insn { code=sta, k=K} ->
 		    io:format("~sM[~w] = A;\n", [L,K]);
 		#bpf_insn { code=stx, k=K} ->
@@ -328,7 +370,7 @@ print_insn(L, J, I) ->
 		    io:format("~sA <<= X;\n", [L]);
 		#bpf_insn { code=rshx } ->
 		    io:format("~sA >>= X;\n", [L]);
-	#bpf_insn { code=neg } ->
+		#bpf_insn { code=neg } ->
 		    io:format("~sA = -A;\n", [L]);
 		#bpf_insn { code=tax } ->
 		    io:format("~sX = A;\n", [L]);
@@ -341,8 +383,7 @@ print_insn(L, J, I) ->
 	    end
     end.
 
-
-print_ld_(Dst,Src,_I,L) ->
+print_ld_c(Dst,Src,_I,L) ->
     D = if Dst =:= 'a' -> "A";
 	   Dst =:= 'x' -> "X"
 	end,
@@ -361,22 +402,90 @@ print_ld_(Dst,Src,_I,L) ->
 	    io:format("~s~s = 4*(P[~w:1]&0xF);\n", [L,D,K])
     end.
 
-print_jmp_(true,k,I,L,J) ->
+print_jmp_c(true,k,I,L,J) ->
     if I#bpf_insn.k =:= 0 ->
 	    io:format("~snop;\n", [L]);
        true ->
-	    io:format("~sgoto ~.3.0w;\n", 
+	    io:format("~sgoto L~.3.0w;\n", 
 		      [L,J+1+I#bpf_insn.k])
     end;
-print_jmp_(Cond,k,I,L,J) ->
-    io:format("~sif (A ~s ~w) goto ~.3.0w; else goto ~.3.0w;\n", 
+print_jmp_c(Cond,k,I,L,J) ->
+    io:format("~sif (A ~s 16#~.16B) goto L~.3.0w; else goto L~.3.0w;\n", 
 	      [L,Cond,I#bpf_insn.k,
 	       J+1+I#bpf_insn.jt,J+1+I#bpf_insn.jf]);
-print_jmp_(Cond,x,I,L,J) ->
-    io:format("~sif (A ~s X) goto ~.3.0w; else goto ~.3.0w;\n", 
+print_jmp_c(Cond,x,I,L,J) ->
+    io:format("~sif (A ~s X) goto L~.3.0w; else goto L~.3.0w;\n", 
 	      [L,Cond,
 	       J+1+I#bpf_insn.jt,J+1+I#bpf_insn.jf]).
 
+%%
+%% Print in pcap format
+%%
+    
+print_p(Prog, J) when J >= 0, J < tuple_size(Prog) ->
+    I = element(J+1,Prog),
+    print_insn_p(J, I),
+    print_p(Prog, J+1);
+print_p(Prog, _J) ->
+    Prog.
+
+print_insn_p(J,I) ->
+    case I of
+	#bpf_insn{code=ldaw,k=K}  -> out_p(J,"ld","[~w]", [K]);
+	#bpf_insn{code=ldah,k=K}  -> out_p(J,"ldh","[~w]", [K]);
+	#bpf_insn{code=ldab,k=K}  -> out_p(J,"ldb","[~w]", [K]);
+	#bpf_insn{code=ldiw,k=K}  -> out_p(J,"ld","[x + ~w]", [K]);
+	#bpf_insn{code=ldih,k=K}  -> out_p(J,"ldh","[x + ~w]", [K]);
+	#bpf_insn{code=ldib,k=K}  -> out_p(J,"ldb","[x + ~w]", [K]); 
+	#bpf_insn{code=ldl }      -> out_p(J,"ld", "len", []);
+	#bpf_insn{code=ldc, k=K}  -> out_p(J,"ld", "#0x~.16b", [K]);
+	#bpf_insn{code=lda, k=K}  -> out_p(J,"ld", "M[~w]", [K]);
+	#bpf_insn{code=ldxc, k=K} -> out_p(J,"ldx","#0x~.16b", [K]);
+	#bpf_insn{code=ldx, k=K}  -> out_p(J,"ldx", "M[~w]", [K]);
+	#bpf_insn{code=ldxl }     -> out_p(J,"ldx", "len", []);
+	#bpf_insn{code=ldxmsh, k=K} -> out_p(J,"ldxb","4*([~w]&0xf)",[K]);
+	#bpf_insn{code=sta,k=K}   -> out_p(J, "st", "M[~w]", [K]);
+	#bpf_insn{code=stx,k=K}   -> out_p(J, "stx", "M[~w]", [K]);
+	#bpf_insn{code=addk, k=K} -> out_p(J, "add", "#~w", [K]);
+	#bpf_insn{code=subk, k=K} -> out_p(J, "sub", "#~w", [K]);
+	#bpf_insn{code=mulk, k=K} -> out_p(J, "mul", "#~w", [K]);
+	#bpf_insn{code=divk, k=K} -> out_p(J, "div", "#~w", [K]);
+	#bpf_insn{code=andk, k=K} -> out_p(J, "and", "#0x~.16b", [K]);
+	#bpf_insn{code=ork,  k=K} -> out_p(J, "or", "#0x~.16b", [K]);
+	#bpf_insn{code=lshk, k=K} -> out_p(J, "lsh", "#~w", [K]);
+	#bpf_insn{code=rshk, k=K} -> out_p(J, "rsh", "#~w", [K]);
+	#bpf_insn{code=addx}      -> out_p(J, "add", "x", []);
+	#bpf_insn{code=subx}      -> out_p(J, "sub", "x", []);
+	#bpf_insn{code=mulx}      -> out_p(J, "mul", "x", []);
+	#bpf_insn{code=divx}      -> out_p(J, "div", "x", []);
+	#bpf_insn{code=andx}      -> out_p(J, "and", "x", []);
+	#bpf_insn{code=orx}       -> out_p(J, "or", "x", []);
+	#bpf_insn{code=lshx}      -> out_p(J, "lsh", "x", []);
+	#bpf_insn{code=rshx}      -> out_p(J, "rsh", "x", []);
+	#bpf_insn{code=neg}       -> out_p(J, "neg", "", []);
+	#bpf_insn{code=jmp,k=K}   -> out_p(J, "jmp", "#0x~.16b", [J+1+K]);
+	#bpf_insn{code=jgtk,k=K}  -> out_pj(J, "jgt", "#0x~.16b", [K],I);
+	#bpf_insn{code=jgek,k=K}  -> out_pj(J, "jge", "#0x~.16b", [K],I);
+	#bpf_insn{code=jeqk,k=K}  -> out_pj(J, "jeq", "#0x~.16b", [K],I);
+	#bpf_insn{code=jsetk,k=K} -> out_pj(J, "jset", "#0x~.16b", [K],I);
+	#bpf_insn{code=jgtx}      -> out_pj(J, "jgt", "x", [], I);
+	#bpf_insn{code=jgex}      -> out_pj(J, "jge", "x", [], I);
+	#bpf_insn{code=jeqx}      -> out_pj(J, "jeq", "x", [], I);
+	#bpf_insn{code=jsetx}     -> out_pj(J, "jset", "x", [], I);
+	#bpf_insn{code=reta}      -> out_p(J, "ret", "", []);
+	#bpf_insn{code=retk,k=K}  -> out_p(J, "ret", "#~w", [K]);
+	#bpf_insn{code=tax}       -> out_p(J, "tax", "", []);
+	#bpf_insn{code=txa}       -> out_p(J, "txa", "", [])
+    end.
+
+out_p(J, Mnemonic, Fmt, Args) ->
+    A = io_lib:format(Fmt, Args),
+    io:format("(~.3.0w) ~-10s~s\n", [J,Mnemonic,A]).
+
+out_pj(J, Mnemonic, Fmt, Args, I) ->
+    A = io_lib:format(Fmt, Args),
+    io:format("(~.3.0w) ~-10s~-18sjt ~w jf ~w\n", 
+	      [J,Mnemonic,A,J+1+I#bpf_insn.jt,J+1+I#bpf_insn.jf]).
 %%
 %% Valudate BPF 
 %%
@@ -426,217 +535,665 @@ validate_(Prog, J) when J =:= tuple_size(Prog) + 1 ->
     Prog.
 
 %%
-%% Optimise BPF programes
+%% Optimise basic blocks
 %%
-optimise(Prog) when is_tuple(Prog) ->
-    optimise_meth_(Prog,
-		   [
-		    fun remove_multiple_jmp/1,
-		    fun remove_ld/1,
-		    fun remove_st/1,
-		    fun kill_nops/1,
-		    fun remove_multiple_jmp/1,
-		    fun print/1,
-		    fun validate/1
-		   ]).
+optimise_bl(Bs) when is_record(Bs,bpf_bs) ->
+    optimise_bl_(Bs, 1).
 
-optimise_meth_(Prog, [F|Fs]) ->
-    case F(Prog) of
-	E={error,_} -> E;
-	Prog1 ->
-	    if Prog =/= Prog1 -> print(Prog1); true -> ok end,    
-	    optimise_meth_(Prog1, Fs)
-    end;
-optimise_meth_(Prog, []) ->
-    Prog.
+optimise_bl_(Bs, I) when I>?MAX_OPTIMISE ->
+    io:format("Looping optimiser (I>~w)\n", [?MAX_OPTIMISE]),
+    print_bs(Bs);
+optimise_bl_(Bs, I) ->
+    io:format("OPTIMISE: ~w\n", [I]),
+    L = [fun remove_ld_bs/1,
+	 fun remove_st_bs/1,
+	 fun remove_multiple_jmp_bs/1,
+	 fun remove_unreach/1,
+	 fun constant_propagation/1,
+	 fun remove_unreach/1],
+    Bs1 = optimise_list_(L, Bs#bpf_bs { changed = 0 }),
+    if Bs1#bpf_bs.changed =:= 0 ->
+	    print_bs(Bs1);
+       true ->
+	    optimise_bl_(Bs1, I+1)
+    end.
 
+optimise_list_([F|Fs], Bs) ->
+    Bs1 = F(Bs),
+    optimise_list_(Fs, Bs1);
+optimise_list_([], Bs) ->
+    Bs.
 
 %% remove duplicate/unnecessary ld M[K] instructions or a sta
-%% Ex1:
-%%    1: M[14] = A
-%%    2: A = M[14]   (killed, if not target address!)
-%% Ex2:
-%%    1: M[14] = A
-%%    2: X = M[15]
-%%    3: A = M[14]   (killed, if not target address!)
-%% Ex3:
-%%    1: M[14] = A
-%%    2: A = A + 45  (killed, not used since A is reloaded in 3)
-%%    3: A = M[14]   (killed, since result is the same as in 1)
-%%
-remove_ld(Prog) ->
-    %% keep this to be sure we do not remove instructions that can be reach
-    %% by jumps.
-    Map = build_target_map_(Prog),
-    remove_ld_(Prog, 1, Map).
+remove_ld_bs(Bs) when is_record(Bs,bpf_bs) ->
+    bs_map_block(
+      fun(B) ->B#bpf_block { insns=remove_ld_bl_(B#bpf_block.insns)} end,
+      Bs).
 
-remove_ld_(Prog, J, Map) when J >= 1, J =< tuple_size(Prog) ->
-    I1 = element(J,Prog),
-    I2 = if J+1 =< tuple_size(Prog) -> element(J+1,Prog); true -> undefined end,
-    I3 = if J+2 =< tuple_size(Prog) -> element(J+2,Prog); true -> undefined end,
-    case {I1,I2,I3} of
-	{ #bpf_insn { code=sta, k=K }, #bpf_insn { code=lda, k=K  }, _ } ->
-	    Prog1 = maybe_nop_(Prog, [J+1], Map),
-	    remove_ld_(Prog1, J+1, Map);
-	{ #bpf_insn { code=sta, k=K }, _, #bpf_insn { code=lda, k=K  }} ->
-	    Js = case class(I2) of
-		     {ret,_}      -> [];
-		     {jmp,_,_}    -> [];
-		     {alu,_,_}    -> [J+1,J+2];
-		     {misc,a,x}   -> [J+1,J+2];
-		     {misc,x,a}   -> [J+2];
-		     {misc,dead,_} -> [J+2];
-		     {st,a,{k,K}} -> [J+1,J+2];
-		     {st,_,_}     -> [J+2];
-		     {ld,x,_}     -> [J+2];
-		     {ld,a,_}     -> [J+1,J+2]
-		 end,
-	    Prog1 = maybe_nop_(Prog, Js, Map),
-	    remove_ld_(Prog1, J+1, Map);
-	_ ->
-	    remove_ld_(Prog, J+1, Map)
+%% M[k] = A, A=M[k]  =>  M[k] = A
+remove_ld_bl_([I1=#bpf_insn { code=sta, k=K}, #bpf_insn {code=lda,k=K}|Is]) ->
+    remove_ld_bl_([I1|Is]);
+%% A=X, M[k]=A  =>  A=X, M[k]=X ; not that A=X must be kept!
+remove_ld_bl_([I1=#bpf_insn { code=txa }, #bpf_insn {code=sta,k=K}|Is]) ->
+    [I1 | remove_ld_bl_([#bpf_insn {code=stx,k=K}| Is])];
+
+%% M[k]=A,X=M[k] =>  M[k]=A, X=A ; not that A=X must be kept!
+remove_ld_bl_([I1=#bpf_insn {code=sta,k=K},_I2=#bpf_insn { code=ldx,k=K}|Is]) ->
+    io:format("REMOVE: ~w\n", [_I2]),
+    [I1 | remove_ld_bl_([#bpf_insn {code=tax}| Is])];
+
+%% M[k] = A, <opA>, A=M[k]  => M[k]=A [<opA]
+remove_ld_bl_([I1=#bpf_insn{code=sta,k=K},I2,_I3=#bpf_insn{code=lda,k=K}|Is]) ->
+    case class(I2) of
+	{alu,_,_}    -> %% ineffective, remove I2,I3
+	    io:format("REMOVE: ~w\n", [I2]),
+	    io:format("REMOVE: ~w\n", [_I3]),
+	    remove_ld_bl_([I1|Is]);
+	{misc,a,x}   -> %% ineffective, remove I2,I3
+	    io:format("REMOVE: ~w\n", [I2]),
+	    io:format("REMOVE: ~w\n", [_I3]),
+	    remove_ld_bl_([I1|Is]);
+	{misc,x,a}   -> %% remove I3 since X is update to A
+	    io:format("REMOVE: ~w\n", [_I3]),
+	    remove_ld_bl_([I1,I2|Is]);
+	{st,a,{k,K}} -> %% I1 = I2 remove I2,I3
+	    io:format("REMOVE: ~w\n", [I2]),
+	    io:format("REMOVE: ~w\n", [_I3]),
+	    remove_ld_bl_([I1|Is]);
+	{st,_,_}     -> %% just remove I3
+	    io:format("REMOVE: ~w\n", [_I3]),
+	    remove_ld_bl_([I1,I2|Is]);	    
+	{ld,x,_}     ->
+	    io:format("REMOVE: ~w\n", [_I3]),
+	    remove_ld_bl_([I1,I2|Is]);
+	{ld,a,_}     -> %% A=<...>  A is reloaded in I3
+	    io:format("REMOVE: ~w\n", [I2]),
+	    io:format("REMOVE: ~w\n", [_I3]),
+	    remove_ld_bl_([I1|Is])
     end;
-remove_ld_(Prog, _J, _Map) ->
-    Prog.
+%% M[k]=X, INSN, X=M[k]  => M[k]=X, INSN
+remove_ld_bl_([I1=#bpf_insn{code=stx,k=K},I2,_I3=#bpf_insn{code=ldx,k=K}|Is]) ->
+    case class(I2) of
+	{alu,_,_} ->   %% A += <...>  do not update X remove I3
+	    io:format("REMOVE: ~w\n", [_I3]),
+	    remove_ld_bl_([I1,I2|Is]);
+	{misc,a,x} ->  %% A=X remove I3
+	    io:format("REMOVE: ~w\n", [_I3]),
+	    remove_ld_bl_([I1,I2|Is]);
+	{misc,x,a} ->  %% X=A ineffective, remove I2,I3
+	    io:format("REMOVE: ~w\n", [I2]),
+	    io:format("REMOVE: ~w\n", [_I3]),
+	    remove_ld_bl_([I1|Is]);
+	{st,x,{k,K}} -> %% I1=I2, duplicate, remove I2,I3
+	    io:format("REMOVE: ~w\n", [I2]),
+	    io:format("REMOVE: ~w\n", [_I3]),
+	    remove_ld_bl_([I1|Is]);
+	{st,x,_} ->     %% remove I3
+	    io:format("REMOVE: ~w\n", [_I3]),
+	    remove_ld_bl_([I1,I2|Is]);
+	{ld,a,_} ->     %% A=<..>, keep x is not updated
+	    remove_ld_bl_([I1,I2|Is]);
+	{ld,x,_}     -> %% X=<..>  X is reloaded in I3 
+	    io:format("REMOVE: ~w\n", [I2]),
+	    io:format("REMOVE: ~w\n", [_I3]),
+	    remove_ld_bl_([I1|Is])
+    end;
+remove_ld_bl_([I|Is]) ->
+    [I|remove_ld_bl_(Is)];
+remove_ld_bl_([]) ->
+    [].
 
-maybe_nop_(Prog, Js, Map) ->
-    case lists:any(fun(J) -> element(J,Map) end, Js) of
-	true  -> Prog;  %% there are jumps into this code
-	false ->
-	    lists:foldl(
-	      fun(J,Pi) ->
-		      io:format("~.3.0w: set to nop\n", [J]),
-		      setelement(J,Pi,nop())
-	      end, Prog, Js)
-    end.
 
 %% remove unnecessary sta|stx instructions ( M[K]=A|X )
-%% Case1
-%%    1: M[k]=A
-%%    ... M[k] is never loaded, kill it
-%% Ex2:
-%%    1: M[k]=X
-%%    ... M[k] is never loaded, kill it
+%% remove:
+%%    M[k]=A     sta, if M[k] is never referenced (before killed)
+%%    M[k]=X     stx, if M[k] is never referenced (before killed)
+%%    A=X        txa  if A is never reference (before killed)
+%%    A=<const>  ldc, if A is never reference (before killed)
+%%    X=A        tax, if X is never reference (before killed)
+%%    X=<const>  ldx, if X is never reference (before killed)
 %%
-remove_st(Prog) ->
-    remove_st_(Prog, 1).
+remove_st_bs(Bs) when is_record(Bs,bpf_bs) ->
+    bs_map_block(fun(B) -> remove_st_bl_(B, Bs) end, Bs).
 
-remove_st_(Prog, J) when J >= 1, J =< tuple_size(Prog) ->
-    I = element(J,Prog),
+remove_st_bl_(B, Bs) ->
+    B#bpf_block { insns = remove_st_bl__(B#bpf_block.insns, B, Bs) }.
+
+remove_st_bl__([I | Is], B, Bs) ->
+    case is_referenced_st(I, Is, B, Bs) of
+	false ->
+	    io:format("REMOVE: ~w\n", [I]),
+	    remove_st_bl__(Is, B, Bs);
+	true ->
+	    [I | remove_st_bl__(Is, B, Bs)]
+    end;
+remove_st_bl__([], _B, _Bs) ->
+    [].
+
+%% check if a st / lda / ldx / tax / txa can be removed
+is_referenced_st(I, Is, B, Bs) ->
     case class(I) of
 	{st,_,{m,K}} ->
-	    case find_ld_(Prog, J+1, K) of
-		false ->
-		    io:format("~.3.0w: set to nop\n", [J]),
-		    Prog1 = setelement(J,Prog,nop()),
-		    remove_st_(Prog1, J+1);
+	    is_referenced_mk(K,Is,B,Bs);
+	{ld,a,_} ->
+	    is_referenced_a(Is,B,Bs);
+	{ld,x,_} ->
+	    is_referenced_x(Is,B,Bs);
+	{misc,a,_} -> %% (txa A=X)
+	    is_referenced_a(Is,B,Bs);
+	{misc,x,_} -> %% (tax X=A)
+	    is_referenced_x(Is,B,Bs);
+	_ ->
+	    true
+    end.
+
+%% check if M[K] is referenced (or killed)
+is_referenced_mk(K, Is, B, Bs) ->
+    loop_insns(
+      fun(J,_Acc) ->
+	      case class(J) of
+		  {ld,_,{m,K}} ->
+		      %% reference is found, keep instruction!
+		      {ok,true};
+		  {st,_,{m,K}} ->
+		      %% reference is killed, check backtrack branches
+		      {skip,false};
+		  _ ->
+		      %% move on
+		      {next,false}
+	      end
+      end, false, Is, B, Bs).
+
+%% check if A is referenced (or killed)
+is_referenced_a(Is,B,Bs) ->
+    loop_insns(
+      fun(J,_Acc) ->
+	      case class(J) of
+		  {alu,_,_} -> %% A is referenced
+		      {ok,true};
+		  {st,a,_} ->  %% A is referenced
+		      {ok,true};
+		  {jmp,true,_} ->
+		      {next,false};
+		  {jmp,_Cmp,_R} -> %% A is referenced
+		      {ok,true};
+		  {ret,a} ->       %% A is referenced
+		      {ok,true};
+		  {misc,_,a} ->    %% A is referenced (tax)
+		      {ok,true};
+		  {misc,a,_} ->    %% A is killed (txa)
+		      {skip,false};
+		  {ld,a,_} ->
+		      %% reference is killed, check backtrack branches
+		      {skip,false};
+		  _ ->
+		      %% move on
+		      {next,false}
+	      end
+      end, false, Is, B, Bs).
+
+%% check if X is referenced (or killed)
+is_referenced_x(Is,B,Bs) ->
+    loop_insns(
+      fun(J,_Acc) ->
+	      case class(J) of
+		  {alu,_,x} -> %% X is referenced
+		      {ok,true};
+		  {st,x,_} -> %% X is referenced
+		      {ok,true};
+		  {jmp,true,_} ->
+		      {next,false};
+		  {jmp,_Cmp,x} -> %% X is referenced
+		      {ok,true};
+		  {misc,_,x} -> %% X is referenced (txa)
+		      {ok,true};
+		  {ld,a,{px,_,_}} -> %% X is referenced
+		      {ok,true};
+		  {misc,x,_} ->    %% X is killed (tax)
+		      {skip,false};
+		  {ld,x,_} ->
+		      %% X is killed, check other branches
+		      {skip,false};
+		  _ ->
+		      %% move on
+		      {next,false}
+	      end
+      end, false, Is, B, Bs).
+    
+%%
+%% iterate through all instructions (including next)
+%% tracing the code path (depth first)
+%%
+loop_insns(Fun, Acc, Is, B, Bs) ->
+    loop_insns_(Fun, Acc, Is++[B#bpf_block.next],[],B,Bs,sets:new()).
+
+loop_insns_(Fun,Acc,[I|Is],As,B,Bs,Vs) ->
+    case Fun(I, Acc) of
+	{ok, Acc1} -> 
+	    Acc1;
+	{skip,Acc1} ->
+	    loop_insns_(Fun,Acc1,[],As,undefined,Bs,Vs);
+	{next,Acc1} -> 
+	    loop_insns_(Fun,Acc1,Is,As,B,Bs,Vs)
+    end;
+loop_insns_(Fun,Acc,[],As,B,Bs,Vs) ->
+    As1 = if B =:= undefined ->
+		  As;
+	     true -> 
+		  As ++ get_fanout(B#bpf_block.next)
+	  end,
+    case As1 of
+	[A|As2] ->
+	    case sets:is_element(A, Vs) of
 		true ->
-		    remove_st_(Prog, J+1)
+		    loop_insns_(Fun,Acc,[],As2,undefined,Bs,Vs);
+		false ->
+		    B1 = bs_get_block(A,Bs),
+		    loop_insns_(Fun, Acc,
+				B1#bpf_block.insns++[B1#bpf_block.next],
+				As2, B1, Bs, sets:add_element(A,Vs))
+	    end;
+	[] ->
+	    Acc
+    end.
+
+%%
+%% remove multiple unconditional jumps 
+%%
+remove_multiple_jmp_bs(Bs) when is_record(Bs,bpf_bs) ->
+    bs_fold_block(fun(B,BsI) -> remove_multiple_jmp_bl_(B, BsI) end, Bs, Bs).
+
+%% 1 - fanout is unconditional jump 
+%%     there are no instructions in the target block, move
+%%     the next instruction (and fanout) to B  (unlink)
+%% 2 - conditional Tf or Tf labels jump to an empty block
+%%     with unconditional jump, then jump to that block
+remove_multiple_jmp_bl_(B, Bs) ->
+    case get_fanout(B#bpf_block.next) of
+	[J] ->
+	    Bj = bs_get_block(J, Bs),
+	    if Bj#bpf_block.insns =:= [] ->
+		    io:format("REPLACE: ~w with ~w\n",
+			      [B#bpf_block.next,Bj#bpf_block.next]),
+		    bs_set_next(B#bpf_block.label, Bj#bpf_block.next, Bs);
+	       true ->
+		    Bs
+	    end;
+	[Jt,Jf] ->
+	    Bt = bs_get_block(Jt, Bs),
+	    Jt2 = case {Bt#bpf_block.insns, get_fanout(Bt#bpf_block.next)} of
+		      {[], [Jt1]} -> Jt1;
+		      _ -> Jt
+		  end,
+	    Bf = bs_get_block(Jf, Bs),
+	    Jf2 = case {Bf#bpf_block.insns, get_fanout(Bf#bpf_block.next)} of
+		      {[], [Jf1]} -> Jf1;
+		      _ -> Jf
+		  end,
+	    if Jt =/= Jt2; Jf =/= Jf2 ->
+		    Next = B#bpf_block.next,
+		    Next1 = Next#bpf_insn { jt=Jt2, jf=Jf2 },
+		    io:format("REPLACE: ~w with ~w\n", [Next,Next1]),
+		    bs_set_next(B#bpf_block.label, Next1, Bs);
+	       true ->
+		    Bs
 	    end;
 	_ ->
-	    remove_st_(Prog, J+1)
-    end;
-remove_st_(Prog, _J) ->
-    Prog.
+	    Bs
+    end.
 
-find_ld_(Prog, J, K) when J =< tuple_size(Prog) ->
-    I = element(J,Prog),
-    case class(I) of
-	{ld,_,{m,K}} -> true;
-	_ -> find_ld_(Prog, J+1, K)
+%%
+%% Remove unreachable blocks
+%%
+remove_unreach(Bs) when is_record(Bs,bpf_bs) ->
+    %% FIXME: Bs#bpf_bs.init instead of 1
+    remove_unreach_([1], Bs, sets:new()).
+
+remove_unreach_([I|Is], Bs, Vs) ->
+    case sets:is_element(I, Vs) of
+	true ->
+	    remove_unreach_(Is, Bs, Vs);
+	false ->
+	    B = bs_get_block(I, Bs),
+	    remove_unreach_(Is++get_fanout(B#bpf_block.next), 
+			    Bs, sets:add_element(I,Vs))
     end;
-find_ld_(_Prog, _J, _K) ->
+remove_unreach_([], Bs, Vs) ->
+    %% Remove blocks not visited
+    All = bs_get_labels(Bs),
+    Remove = All -- sets:to_list(Vs),
+    lists:foldl(fun(I,Bsi) -> 
+			io:format("REMOVE BLOCK: ~w\n", [I]),
+			bs_del_block(I, Bsi) end, 
+		Bs, Remove).
+
+%%
+%% Constant propagation
+%%     for each node 
+%%     recursive calculate the constants for all
+%%     fan in. 
+%%     calculate the union of all constants
+%%     and proceed then do the block 
+%%
+constant_propagation(Bs) when is_record(Bs,bpf_bs) ->
+    Ls = bs_get_labels(Bs),
+    {Bs1,_,_} = constant_propagation_(Ls, Bs, dict:new(), sets:new()),
+    Bs1.
+
+%% Ds is dict of dicts of block calculations, Vs is set of visited nodes
+constant_propagation_([I|Is], Bs, Ds, Vs) ->
+    case sets:is_element(I, Vs) of
+	true ->
+	    constant_propagation_(Is,Bs,Ds,Vs);
+	false ->
+	    %% io:format("find label = ~w\n", [I]),
+	    B0 = bs_get_block(I, Bs),
+	    FanIn = bs_get_fanin(I, Bs),
+	    %% io:format("I=~w fanin=~w\n", [I, FanIn]),
+	    Vs1 = sets:add_element(I,Vs),
+	    {Bs1,Ds1,Vs2} = constant_propagation_(FanIn,Bs,Ds,Vs1),
+	    D0 = constant_intersect_(FanIn,Ds1),
+	    {B1,D1} = constant_eval_(B0,D0),
+	    Ds2 = dict:store(I,D1,Ds1),
+	    constant_propagation_(Is, bs_set_block(B1,Bs1),Ds2,Vs2)
+    end;
+constant_propagation_([],Bs,Ds,Vs) ->
+    {Bs,Ds,Vs}.
+
+%% constant propagate instructions in block B given values in 
+%% dictionary D
+constant_eval_(B, D) ->
+    io:format("EVAL: ~w\n", [B#bpf_block.label]),
+    {Is,D1} = constant_ev_(B#bpf_block.insns,[],D),
+    Next = constant_ev_jmp_(B#bpf_block.next, D1),
+    if Next =/= B#bpf_block.next ->
+	    io:format("Replace: ~w with ~w\n", [B#bpf_block.next, Next]);
+       true -> ok
+    end,
+    {B#bpf_block { insns = Is, next=Next }, D1}.
+
+
+constant_ev_([I|Is],Js,D) ->
+    %% io:format("  EV: ~w in dict=~w\n", [I, dict:to_list(D)]),
+    K = I#bpf_insn.k,
+    case I#bpf_insn.code of
+	ldaw ->
+	    constant_set_(I, Is, Js, a, {p,K,4}, D);
+	ldah ->
+	    constant_set_(I, Is, Js, a, {p,K,2}, D);
+	ldab ->
+	    constant_set_(I, Is, Js, a, {p,K,1}, D);
+	ldiw ->
+	    constant_set_(I, Is, Js, a, {p,get_reg(x,D),K,4}, D);
+	ldih ->
+	    constant_set_(I, Is, Js, a, {p,get_reg(x,D),K,2}, D);
+	ldib ->
+	    constant_set_(I, Is, Js, a, {p,get_reg(x,D),K,1}, D);
+	ldl  ->
+	    constant_set_(I, Is, Js, a, {l,4}, D);
+	ldc  ->
+	    constant_set_(I, Is, Js, a, K, D);
+	lda  ->
+	    case get_reg({m,K},D) of
+		K1 when is_integer(K1) ->
+		    I1 = I#bpf_insn{code=ldc,k=K1},
+		    io:format("CHANGE: ~w TO ~w\n", [I, I1]),
+		    constant_ev_(Is,[I1|Js],set_reg(a,K1,D));
+		R ->
+		    constant_ev_(Is,[I|Js], set_reg(a,R,D))
+	    end;
+	ldxc -> 
+	    constant_set_(I, Is, Js, x, K, D);
+	ldx ->
+	    %% fixme check if x already is loaded with the value
+	    case get_reg({m,K}, D) of
+		K1 when is_integer(K1) ->
+		    I1 = I#bpf_insn{code=ldxc,k=K1},
+		    io:format("CHANGE: ~w TO ~w\n", [I, I1]),
+		    constant_ev_(Is,[I1|Js], set_reg(x,K1,D));
+		R ->
+		    constant_ev_(Is,[I|Js], set_reg(x,R,D))
+	    end;
+	ldxl ->
+	    constant_set_(I, Is, Js, x, {l,4}, D);
+	ldxmsh -> 
+	    constant_set_(I, Is, Js, x, {msh,K}, D);
+	sta  ->
+	    constant_ev_(Is, [I|Js], set_reg({m,K},get_reg(a,D),D));
+	stx  ->
+	    constant_ev_(Is, [I|Js], set_reg({m,K},get_reg(x,D),D));
+	addk -> eval_op_(I, Is, Js, D, '+',  a, K, ldc, addk);
+	subk -> eval_op_(I, Is, Js, D, '-',  a, K, ldc, subk);
+	mulk -> eval_op_(I, Is, Js, D, '*',  a, K, ldc, mulk);
+	divk -> eval_op_(I, Is, Js, D, '/',  a, K, ldc, divk);
+	andk -> eval_op_(I, Is, Js, D, '&',  a, K, ldc, andk);
+	ork  -> eval_op_(I, Is, Js, D, '|',  a, K, ldc, ork);
+	lshk -> eval_op_(I, Is, Js, D, '<<',  a, K, ldc, lshk);
+	rshk -> eval_op_(I, Is, Js, D, '>>',  a, K, ldc, rshk); 
+	addx -> eval_op_(I, Is, Js, D, '+',  a, x, ldc, addk);
+	subx -> eval_op_(I, Is, Js, D, '-',  a, x, ldc, subk);
+	mulx -> eval_op_(I, Is, Js, D, '*',  a, x, ldc, mulk);
+	divx -> eval_op_(I, Is, Js, D, '/',  a, x, ldc, divk);
+	andx -> eval_op_(I, Is, Js, D, '&',  a, x, ldc, andk);
+	orx  -> eval_op_(I, Is, Js, D, '|',  a, x, ldc, ork);
+	lshx -> eval_op_(I, Is, Js, D, '<<', a, x, ldc, lshk);
+	rshx -> eval_op_(I, Is, Js, D, '>>', a, x, ldc, rshk);
+	neg  -> eval_op_(I, Is, Js, D, '-',  a, ldc);
+	tax  -> eval_op_(I, Is, Js, D, '=',  x, a, ldxc, ldxc);
+	txa  -> eval_op_(I, Is, Js, D, '=',  a, x, ldc, ldc)
+    end;
+constant_ev_([], Js, D) ->
+    {reverse(Js), D}.
+
+%% set register to value if not already set, then remove the instruction
+constant_set_(I, Is, Js, R, V, D) ->
+    case get_reg(R, D) of
+	undefined -> %% no value defined
+	    constant_ev_(Is,[I|Js], set_reg(R, V, D));
+	V -> %% value already loaded
+	    io:format("REMOVE: ~w, value ~w already set\n", [I,V]),
+	    constant_ev_(Is,Js,D);
+	_ ->
+	    constant_ev_(Is,[I|Js], set_reg(R, V, D))
+    end.
+
+constant_ev_jmp_(I, D) ->
+    %% io:format("  EV_JMP: ~w in dict=~w\n", [I, dict:to_list(D)]),
+    case I#bpf_insn.code of
+	retk -> I;
+	reta -> I;
+	jmp  -> I;
+	jgtk  -> constant_ev_jmpk_(I,fun(A,K) -> A > K end,D);
+	jgek  -> constant_ev_jmpk_(I,fun(A,K) -> A >= K end,D);
+	jeqk  -> constant_ev_jmpk_(I,fun(A,K) -> A =:= K end,D);
+	jsetk -> constant_ev_jmpk_(I,fun(A,K) -> (A band K) =/= 0 end,D);
+	jgtx  -> constant_ev_jmpx_(I,fun(A,X) -> A > X end, jgtk,D);
+	jgex  -> constant_ev_jmpx_(I,fun(A,X) -> A >= X end, jgek,D);
+	jeqx  -> constant_ev_jmpx_(I,fun(A,X) -> A =:= X end, jeqk,D);
+	jsetx -> constant_ev_jmpx_(I,fun(A,X) -> (A band X) =/= 0 end,jsetk,D)
+    end.
+
+constant_ev_jmpk_(I=#bpf_insn { jt=Jt, jf=Jf, k=K }, Cmp, D) ->
+    case get_reg(a, D) of
+	A when is_integer(A) ->
+	    I1 = case Cmp(A,K) of
+		     true  -> #bpf_insn { code=jmp, k=Jt };
+		     false -> #bpf_insn { code=jmp, k=Jf }
+		 end,
+	    io:format("CHANGE: ~w TO ~w\n", [I, I1]),
+	    I1;
+	_R -> I
+    end.
+
+constant_ev_jmpx_(I=#bpf_insn { jt=Jt, jf=Jf },Cmp,JmpK,D) ->
+    case get_reg(a, D) of
+	A when is_integer(A) ->
+	    case get_reg(x, D) of
+		X when is_integer(X) ->
+		    I1 = case Cmp(A,X) of
+			     true  -> #bpf_insn { code=jmp, k=Jt };
+			     false -> #bpf_insn { code=jmp, k=Jf }
+			 end,
+		    io:format("CHANGE: ~w TO ~w\n", [I, I1]),
+		    I1;
+		_ -> 
+		    I
+	    end;
+	_ ->
+	    case get_reg(x, D) of
+		X when is_integer(X) -> 
+		    I1 = I#bpf_insn { code=JmpK, k=X },
+		    io:format("CHANGE: ~w TO ~w\n", [I, I1]),
+		    I1;
+		_ ->
+		    I
+	    end
+    end.
+
+%% translate operation depending on outcome of calculation
+eval_op_(I, Is, Js, D, Op, R, A, Op1, Op2) ->
+    case eval_reg(Op,R,A,D) of
+	K1 when is_integer(K1) ->
+	    D1 = set_reg(R,K1,D),
+	    I1 = I#bpf_insn { code=Op1, k=K1},
+	    io:format("CHANGE: ~w TO ~w\n", [I, I1]),
+	    constant_ev_(Is, [I1|Js], D1);
+	V1 ->
+	    D1 = set_reg(R,V1,D),
+	    case get_reg(A, D1) of
+		K0 when is_integer(K0) ->
+		    I1 = I#bpf_insn { code=Op2, k=K0},
+		    io:format("CHANGE: ~w TO ~w\n", [I, I1]),
+		    constant_ev_(Is, [I1|Js], D1);
+		_ ->
+		    constant_ev_(Is, [I|Js], D1)
+	    end
+    end.
+
+eval_op_(I, Is, Js, D, Op, R, OpK) ->
+    case eval_reg(Op,R,D) of
+	K1 when is_integer(K1) ->
+	    D1 = set_reg(R,K1,D),
+	    I1 = I#bpf_insn { code=OpK, k=K1},
+	    io:format("CHANGE: ~w TO ~w\n", [I, I1]),
+	    constant_ev_(Is, [I1|Js], D1);
+	V1 ->
+	    D1 = set_reg(R,V1,D),
+	    constant_ev_(Is, [I|Js], D1)
+    end.
+
+
+set_reg(R, undefined, D) ->
+    dict:erase(R, D);
+set_reg(R, V, D) ->
+    %% io:format("set_reg: ~w = ~w\n", [R, V]),
+    dict:store(R, V, D).
+
+get_reg(R, _D) when is_integer(R) ->
+    %% io:format("get_reg: ~w\n", [R]),
+    R;
+get_reg(R, D) ->
+    case dict:find(R, D) of
+	{ok,V} -> 
+	    %% io:format("get_reg: ~w = ~w\n", [R,V]),
+	    V;
+	error ->
+	    %% io:format("get_reg: ~w = undefined\n", [R]),
+	    undefined
+    end.
+
+eval_reg(Op,A,B,D) ->
+    V = eval_reg_(Op, get_reg(A,D), get_reg(B,D)),
+    %% io:format("eval_reg: (~w ~s ~w) = ~w\n", [Op,A,B,V]),
+    V.
+
+eval_reg(Op,A,D) ->
+    V = eval_reg_(Op, get_reg(A,D)),
+    %% io:format("eval_reg: ~s ~w = ~w\n", [Op,A,V]),
+    V.    
+
+eval_reg_('*', 0, _) -> 0;
+eval_reg_('*', _, 0) -> 0;
+eval_reg_('*', 1, X) -> X;
+eval_reg_('*', X, 1) -> X;
+eval_reg_('+', 0, X) -> X;
+eval_reg_('+', X, 0) -> X;
+eval_reg_('/', _, 0) -> undefined;
+eval_reg_('/', X, 1) -> X;
+eval_reg_('-', X, 0) -> X;
+eval_reg_('=', _, X) -> X;
+%% add some more here
+eval_reg_('-', 0, X) when is_integer(X) -> ?uint32(-X);
+%% regular calculation
+eval_reg_(_Op, undefined, _) -> undefined;
+eval_reg_(_Op, _, undefined) -> undefined;
+
+eval_reg_('+', A, B) when is_integer(A), is_integer(B) -> ?uint32(A+B);
+eval_reg_('+', A, B) -> {'+',A,B};
+eval_reg_('-', A, B) when is_integer(A), is_integer(B) -> ?uint32(A-B);
+eval_reg_('-', A, B) -> {'-',A,B};
+eval_reg_('*', A, B) when is_integer(A), is_integer(B) -> ?uint32(A*B);
+eval_reg_('*', A, B) -> {'*',A,B};
+eval_reg_('/', A, B) when is_integer(A), is_integer(B) ->  A div B;
+eval_reg_('/', A, B) -> {'/',A,B};
+eval_reg_('&', A, B) when is_integer(A), is_integer(B) -> A band B;
+eval_reg_('&', A, B) -> {'&',A,B};
+eval_reg_('|', A, B) when is_integer(A), is_integer(B) -> A bor B;
+eval_reg_('|', A, B) -> {'|',A,B};
+eval_reg_('<<', A, B) when is_integer(A), is_integer(B) -> ?uint32(A bsl B);
+eval_reg_('<<', A, B) -> {'<<',A,B};
+eval_reg_('>>', A, B) when is_integer(A), is_integer(B) -> A bsr B;
+eval_reg_('>>', A, B) -> {'>>',A,B}.
+
+eval_reg_('-', A) when is_integer(A) -> ?uint32(-A);
+eval_reg_('-', undefined) -> undefined;
+eval_reg_('-', A) -> {'-', A}.
+
+constant_intersect_([I], Ds) ->
+    dict:fetch(I, Ds);
+constant_intersect_([I|Is], Ds) ->
+    Di = constant_intersect_(Is, Ds),
+    dict_intersect(dict:fetch(I, Ds), Di);
+constant_intersect_([], _) ->
+    dict:new().
+    
+%% all keys present in both A and B are 
+dict_intersect(A, B) ->
+    dict:fold(
+      fun(K,Va,C) ->
+	      case dict:is_key(K,B) of
+		  true ->
+		      Vb = dict:fetch(K,B),
+		      case intersect_value(Va,Vb) of
+			  {true,Vc} ->
+			      dict:store(K, Vc, C);
+			  false ->
+			      C
+		      end;
+		  false ->
+		      C
+	      end
+      end, dict:new(), A).
+
+%% simple version true only if values are identical
+intersect_value(X, X) ->    
+    {true,X};
+intersect_value(X,Y) ->	
+    io:format("intersect: ~w ~w => false\n", [X,Y]),
     false.
 
-
-%% remove indirection jumps & move return 
-remove_multiple_jmp(Prog) ->
-    case optimise_jmp_(Prog, 1) of
-	Prog -> Prog;
-	Prog1 ->
-	    Prog2 = mark_unreach(Prog1),
-	    compact(Prog2)
-    end.
-
-optimise_jmp_(Prog, J) when J >= 1, J =< tuple_size(Prog) ->
-    I = element(J,Prog),
-    case class(I) of 
-	{jmp,true,k} ->
-	    K0 = I#bpf_insn.k,
-	    case follow_jump_(Prog, J, K0) of
-		{I1=#bpf_insn{code=reta}, _} ->
-		    io:format("~.3.0w: jump to ~w changed to ~w\n", 
-			      [J,K0,reta]),
-		    Prog1=setelement(J,Prog,I1),
-		    optimise_jmp_(Prog1, J+1);
-		{I1=#bpf_insn{code=retk}} ->
-		    io:format("~.3.0w: jump to ~w changed to ~w\n", 
-			      [J,K0,retk]),
-		    Prog1=setelement(J,Prog,I1),
-		    optimise_jmp_(Prog1, J+1);
-		{_,K1} ->
-		    io:format("~.3.0w: jump to ~w changed to ~w\n", [J,K0,K1]),
-		    Prog1=setelement(J,Prog,I#bpf_insn { k=K1 }),
-		    optimise_jmp_(Prog1, J+1);
-		_ ->
-		    optimise_jmp_(Prog, J+1)
-	    end;
-	{jmp,_Cond,_R} ->
-	    optimise_cond_jmp_(Prog,J,I);
-	_ ->
-	    optimise_jmp_(Prog, J+1)
-    end;
-optimise_jmp_(Prog, _J) ->
-    Prog.
-
-%% optimise conditional lables by tracing jump path
-%% follow unconditional jumps, also if jump ends in 
-%% retk or reta find the last occurence of a retk|reta
-%% and jump there (fixme long jumps!)
-
-optimise_cond_jmp_(Prog,J,I) ->
-    Jt0 = I#bpf_insn.jt,
-    Jf0 = I#bpf_insn.jf,
-    {It,Jt1} = follow_jump_(Prog,J,Jt0),
-    {If,Jf1} = follow_jump_(Prog,J,Jf0),
-    Jt2 = jmp_last_return(Prog,J,It,Jt1),
-    Jf2 = jmp_last_return(Prog,J,If,Jf1),
-    io:format("~.3.0w: jt ~w->~w, ft ~w->~w\n", [J,Jt0,Jt2,Jf0,Jf2]),
-    Prog1=setelement(J,Prog,I#bpf_insn { jt=Jt2, jf=Jf2 }),
-    optimise_jmp_(Prog1, J+1).
-
-jmp_last_return(Prog,J,I=#bpf_insn{code=retk},_Offs) ->
-    J1 = jmp_last_pos_(Prog,J,tuple_size(Prog),I),
-    (J1-J)-1;
-jmp_last_return(Prog,J,I=#bpf_insn{code=reta},_Offs) ->
-    J1 = jmp_last_pos_(Prog,J,tuple_size(Prog),I),
-    (J1 - J)-1;
-jmp_last_return(_Prog,_J,_I,Offs) ->
-    Offs.
-
-jmp_last_pos_(Prog,J,J1,I) ->
-    case element(J1,Prog) of
-	I -> J1;
-	_ -> jmp_last_pos_(Prog,J,J1-1,I)
-    end.
-
-follow_jump_(Prog,J,Offs) ->
-    J1 = J+1+Offs,
-    I  = element(J1,Prog),
-    case I of
-	#bpf_insn { code=jmp, k=K} ->
-	    follow_jump_(Prog,J,Offs+1+K);
-	_ -> {I,Offs}
-    end.
-
 %%
-%% Create basic block representation from program.
+%% Create basic block representation from tuple program.
+%% The labels will initially be the address of the first
+%% instruction in the block.
+%% Label 1 must always be present and represent the first
+%% instruction.
 %%
-make_basic_block(Prog) when is_tuple(Prog) ->
+prog_to_bs(Prog) when is_tuple(Prog) ->
     Map = build_target_map_(Prog),
-    make_basic_block_(Prog, 1, Map, 1, [], []).
+    prog_to_bs_(Prog, 1, Map, 1, [], bs_new()).
 
-make_basic_block_(Prog, J, Map, A, Acc, Bs) when J =< tuple_size(Prog) ->
+prog_to_bs_(Prog, J, Map, A, Acc, Bs) when J =< tuple_size(Prog) ->
     I = element(J, Prog),
     case class(I) of
 	{jmp,true,_} ->
@@ -644,185 +1201,109 @@ make_basic_block_(Prog, J, Map, A, Acc, Bs) when J =< tuple_size(Prog) ->
 	    B = #bpf_block { label = A,
 			     insns = reverse(Acc),
 			     next  = I#bpf_insn { k = L }},
-	    make_basic_block_(Prog,J+1,Map,J+1,[],[B|Bs]);
+	    prog_to_bs_(Prog,J+1,Map,J+1,[],bs_add_block(B,Bs));
 	{jmp,_,_} ->
 	    Lt = J+1+I#bpf_insn.jt,
 	    Lf = J+1+I#bpf_insn.jf,
 	    B = #bpf_block { label = A,
 			     insns = reverse(Acc),
 			     next = I#bpf_insn { jt=Lt, jf=Lf }},
-	    make_basic_block_(Prog,J+1,Map,J+1,[],[B|Bs]);
+	    prog_to_bs_(Prog,J+1,Map,J+1,[],bs_add_block(B,Bs));
 	{ret,_} ->
 	    B = #bpf_block { label = A,
 			     insns = reverse(Acc),
 			     next = I},
-	    make_basic_block_(Prog,J+1,Map,J+1,[],[B|Bs]);
+	    prog_to_bs_(Prog,J+1,Map,J+1,[],bs_add_block(B,Bs));
 	_ ->
 	    case element(J,Map) of
-		true -> %% J: is a jump target
-		    if Acc == [] ->
-			    io:format("Acc empty\n"),
-			    make_basic_block_(Prog,J+1,Map,J,[I],Bs);
+		true ->
+		    if A =:= J ->
+			    prog_to_bs_(Prog,J+1,Map,A,[I|Acc],Bs);
 		       true ->
-			    io:format("Insert: Goto ~w\n", [J]),
 			    B = #bpf_block { label = A,
 					     insns = reverse(Acc),
-					     next = #bpf_insn { code=jmp, 
-								k = J }},
-			    make_basic_block_(Prog,J+1,Map,J,[I],[B|Bs])
+					     next = #bpf_insn { code=jmp,
+								k=J }},
+			    prog_to_bs_(Prog,J+1,Map,J,[I],bs_add_block(B,Bs))
 		    end;
 		false ->
-		    make_basic_block_(Prog,J+1,Map,A,[I|Acc],Bs)
+		    prog_to_bs_(Prog,J+1,Map,A,[I|Acc],Bs)
 	    end
     end;
-make_basic_block_(_Prog, _J, _Map, A, Acc, Bs) ->
+prog_to_bs_(_Prog, _J, _Map, A, Acc, Bs) ->
     if Acc =:= [] ->
-	    reverse(Bs);
+	    Bs;
        true ->
 	    B = #bpf_block { label = A,
 			     insns = reverse(Acc),
-			     next  = reject()     %% default reject ?
+			     next  = reject()
 			   },
-	    reverse([B|Bs])
+	    bs_add_block(B, Bs)
     end.
 
 %%
-%% Mark all unreachable instruction (replace them with 'dead')
+%% Convert a basic block representation into a program
 %%
-mark_unreach(Prog) ->
-    Rs = mark_unreach_(Prog, queue:in(1, queue:new()), 
-		       sets:from_list([1])),
-    %% done mark all instructions not in Rs as unreach
-    lists:foldl(
-      fun(J,Pj) ->
-	      case sets:is_element(J, Rs) of
-		  false -> 
-		      io:format("~.3.0w: set to dead\n", [J]),
-		      setelement(J, Pj, #bpf_insn { code=dead });
-		  true -> Pj
-	      end
-      end, Prog, lists:seq(1, tuple_size(Prog))).
-
-mark_unreach_(Prog, Q, Rs) ->
-    case queue:out(Q) of
-	{empty,_Q1} ->
-	    Rs;
-	{{value,J},Q1} ->
-	    I = element(J, Prog),
-	    case class(I) of
-		{jmp,true,k} ->
-		    mark_uncond_unreach_(Prog,J+1+I#bpf_insn.k,Q1,Rs);
-		{jmp,_Cond,_R} ->
-		    mark_cond_unreach_(Prog,J,I,Q1,Rs);
-		_ ->
-		    case I#bpf_insn.code of
-			reta  -> mark_unreach_(Prog,Q1,Rs);
-			retk  -> mark_unreach_(Prog,Q1,Rs);
-			_ -> mark_uncond_unreach_(Prog,J+1,Q1,Rs)
-		    end
-	    end
-    end.
-
-mark_uncond_unreach_(Prog,J,Q,Rs) ->		    
-    case sets:is_element(J, Rs) of
-	true ->
-	    mark_unreach_(Prog, Q, Rs);
-	false ->
-	    Rs1 = sets:add_element(J, Rs),
-	    Q1  = queue:in(J, Q),
-	    mark_unreach_(Prog, Q1, Rs1)
-    end.
-    
-mark_cond_unreach_(Prog,J,I,Q0,Rs0) ->
-    Jt = J+1+I#bpf_insn.jt,
-    {Q1,Rs1} = case sets:is_element(Jt, Rs0) of
-		   true  -> {Q0,Rs0};
-		   false -> {queue:in(Jt, Q0),
-			     sets:add_element(Jt,Rs0)}
-	       end,
-    Jf = J+1+I#bpf_insn.jf,
-    {Q2,Rs2} = case sets:is_element(Jf, Rs1) of
-		   true  -> {Q1,Rs1};
-		   false -> {queue:in(Jf, Q1),
-			     sets:add_element(Jf,Rs1)}
-	       end,
-    mark_unreach_(Prog, Q2, Rs2).
-
+%% topological sort, 1 must be present and be less than all other nodes
 %%
-%% Kill nops (replace with dead) if possible
-%%
-kill_nops(Prog) ->
-    Map = build_target_map_(Prog),
-    kill_nops_(Prog, 1, Map, 0).
+bs_to_prog(Bs) when is_record(Bs,bpf_bs) ->
+    Bs1 = topsort(Bs),
+    to_prog_(Bs1,1,[],[]).
 
-kill_nops_(Prog, J, Map, N) when J =< tuple_size(Prog) ->
-    I = element(J,Prog),
-    case I of
-	#bpf_insn {code=jmp,k=0} ->
-	    case element(J,Map) of
-		true -> kill_nops_(Prog, J+1, Map, N);
-		false ->
-		    io:format("~.3.0w: set to dead\n", [J]),
-		    Prog1 = setelement(J, Prog, #bpf_insn { code=dead }),
-		    kill_nops_(Prog1,J+1,Map,N+1)
-	    end;
+%% first map blocks into positions
+to_prog_([B|Bs], Pos, Ins, Map) ->
+    N = length(B#bpf_block.insns),
+    case get_fanout(B#bpf_block.next) of
+	[L1] when (hd(Bs))#bpf_block.label =:= L1 ->
+	    %% do not add dummy jump
+	    to_prog_(Bs, Pos+N,
+		     [B#bpf_block.insns | Ins],
+		     [{B#bpf_block.label,Pos}|Map]);
 	_ ->
-	    kill_nops_(Prog,J+1,Map,N)
+	    to_prog_(Bs, Pos+N+1,
+			[B#bpf_block.next, B#bpf_block.insns | Ins],
+			[{B#bpf_block.label,Pos}|Map])
     end;
-kill_nops_(Prog,_J,_Map,N) ->
-    if N > 0 -> compact(Prog);
-       true -> Prog
-    end.
+to_prog_([],_Pos,Ins,Map) ->
+    Ins1 = lists:flatten(reverse(Ins)),
+    list_to_tuple(prog_map_(Ins1, 1, Map)).
 
-%%
-%% Remove all dead position in the code
-%%
-compact(Prog) ->
-    Map = build_number_map_(Prog),
-    compact_build_(Prog,1,Map,[]).
-    
-%% build the new code where the unreach instructions are removed by
-%% updating jump instructions with new offsets
-compact_build_(Prog,J,Map,Acc) when J =< tuple_size(Prog) ->
-    I = element(J,Prog),
+%% now assign the relative jumps
+prog_map_([I|Is], J, Map) ->
     case class(I) of
-	{jmp,true,k} ->
-	    J1 = J+1+I#bpf_insn.k,
-	    K1 = (element(J1,Map)-element(J,Map))-1,
-	    compact_build_(Prog,J+1,Map,
-				    [I#bpf_insn { k=K1} | Acc]);
-	{jmp,_Cond,_R} ->
-	    J1 = J+1+I#bpf_insn.jt,
-	    Jt = (element(J1,Map)-element(J,Map))-1,
-	    J2 = J+1+I#bpf_insn.jf,
-	    Jf = (element(J2,Map)-element(J,Map))-1,
-	    compact_build_(Prog,J+1,Map,
-				    [I#bpf_insn { jt=Jt,jf=Jf} | Acc]);
+	{jmp,true,_} ->
+	    {_,A} = lists:keyfind(I#bpf_insn.k, 1, Map),
+	    [I#bpf_insn { k=A-J-1 } | prog_map_(Is, J+1, Map)];
+	{jmp,_,_} ->
+	    {_,At} = lists:keyfind(I#bpf_insn.jt, 1, Map),
+	    {_,Af} = lists:keyfind(I#bpf_insn.jf, 1, Map),
+	    [I#bpf_insn { jt=At-J-1, jf=Af-J-1 } | prog_map_(Is, J+1, Map)];
 	_ ->
-	    if I#bpf_insn.code =:= dead ->
-		    compact_build_(Prog,J+1,Map,Acc);
-	       true ->
-		    compact_build_(Prog,J+1,Map,[I|Acc])
-	    end
+	    [I|prog_map_(Is,J+1,Map)]
     end;
-compact_build_(_Prog,_J,_Map,Acc) ->
-    list_to_tuple(reverse(Acc)).
+prog_map_([], _J, _Map) ->
+    [].
 
 %%
-%% Create a map from instruction position to instruction number
-%% not counting the dead instructions (generated by mark_unreach_)
+%% Topological sort the basic block DAG.
 %%
-build_number_map_(Prog) ->
-    build_number_map_(Prog,1,1,[]).
+topsort(Bs) ->
+    topsort_([1], Bs, [], sets:new()).
 
-%% build a map of instruction numbers
-build_number_map_(Prog,J,J1,Acc) when J =< tuple_size(Prog) ->
-    case element(J, Prog) of
-	#bpf_insn {code=dead} -> build_number_map_(Prog,J+1,J1,[J1|Acc]);
-	_ -> build_number_map_(Prog,J+1,J1+1,[J1|Acc])
+topsort_([{add,N,Bn}|Q], Bs, L, Vs) ->
+    topsort_(Q, Bs, [Bn|L], sets:add_element(N,Vs));
+topsort_([N|Q], Bs, L, Vs) ->
+    case sets:is_element(N, Vs) of
+	true ->
+	    topsort_(Q, Bs, L, Vs);
+	false ->
+	    Bn = bs_get_block(N,Bs),
+	    topsort_(get_fanout(Bn#bpf_block.next) ++
+			 [{add,N,Bn}]++Q, Bs, L, Vs)
     end;
-build_number_map_(_Prog,_J0,_J1,Acc) ->
-    list_to_tuple(reverse(Acc)).
+topsort_([], _Bs, L, _Vs) ->
+    L.
+
 
 %%
 %% Create a map of positions that are reachable from a jump
@@ -854,8 +1335,6 @@ build_target_map_(Prog,_J,Acc) ->
 %%
 %% Execute BPF (debugging and runtime support when missing in kernel or library)
 %%
-exec(Is, P) when is_list(Is), is_binary(P) ->
-    exec(list_to_tuple(Is), P);
 exec(Prog, P) when is_tuple(Prog), is_binary(P) ->
     exec0(Prog, 1, 0, 0, P, erlang:make_tuple(?BPF_MEMWORDS, 0)).
 
@@ -876,7 +1355,7 @@ exec0(Prog,Pc,A,X,P,M) ->
 	throw:mem_index -> 0
     end.
 
--define(uint32(X), ((X) band 16#ffffffff)).
+
 
 -define(ldmem(K,M),
 	if (K) >= 0, (K) < tuple_size((M)) ->
@@ -1001,6 +1480,7 @@ ld_(P,K,Size) ->
 -define(OFFS_IPV4_CSUM,  (?OFFS_ETH_DATA+10)).
 -define(OFFS_IPV4_SRC,   (?OFFS_ETH_DATA+12)).
 -define(OFFS_IPV4_DST,   (?OFFS_ETH_DATA+16)).
+-define(OFFS_IPV4_DATA,  (?OFFS_ETH_DATA+20)).
 
 -define(OFFS_IPV6_LEN,  (?OFFS_ETH_DATA+4)).
 -define(OFFS_IPV6_NEXT, (?OFFS_ETH_DATA+6)).
@@ -1032,48 +1512,50 @@ ld_(P,K,Size) ->
 -define(OFFS_UDP_DST_PORT,  2).  %% uint16
 -define(OFFS_UDP_LENGTH,    4).  %% uint16
 -define(OFFS_UDP_CSUM,      6).  %% uint16
+-define(OFFS_UDP_DATA,      8).  
 
 -define(XOFFS_UDP_SRC_PORT, ?OFFS_ETH_DATA+?OFFS_UDP_SRC_PORT).
 -define(XOFFS_UDP_DST_PORT, ?OFFS_ETH_DATA+?OFFS_UDP_DST_PORT).
 -define(XOFFS_UDP_LENGTH,   ?OFFS_ETH_DATA+?OFFS_UDP_LENGTH).
 -define(XOFFS_UDP_CSUM,     ?OFFS_ETH_DATA+?OFFS_UDP_CSUM).
+-define(XOFFS_UDP_DATA,     ?OFFS_ETH_DATA+?OFFS_UDP_DATA).
 
-
+%% (nested) list of code, default to reject
 build_program(Code) when is_list(Code) ->
     Prog = list_to_tuple(lists:flatten([Code,reject()])),
-    case validate(Prog) of
-	E={error,_} -> E;
-	_ -> 
-	    Prog1 = optimise(Prog),
-	    Bs = make_basic_block(Prog1),
-	    print_bs(Bs),
-	    Prog1
-    end.
+    build_(Prog).
 
+%% (nested) list of code returning ackumulator value
 build_programa(Code) when is_list(Code) ->
     Prog = list_to_tuple(lists:flatten([Code,return()])),
-    case validate(Prog) of
-	E={error,_} -> E;
-	_ -> 
-	    Prog1 = optimise(Prog),
-	    Bs = make_basic_block(Prog1),
-	    print_bs(Bs),
-	    Prog1
-    end.
+    build_(Prog).
 
+%% build expression, A>0 => accept, A=0 => reject
 build_programx(Expr) ->
     X = expr(Expr),
     Prog = list_to_tuple(lists:flatten([X,
 					if_gtk(0, [accept()], [reject()]),
 					reject()])),
-    print(Prog),
-    case validate(Prog) of
+    build_(Prog).
+
+
+build_(Prog0) ->
+    io:format("program 0\n"),
+    io:format("---------\n"),
+    Bs0 = prog_to_bs(Prog0),
+    print_bs(Bs0),
+    case validate(Prog0) of
 	E={error,_} -> E;
-	_ -> 
-	    Prog1 = optimise(Prog),
-	    Bs = make_basic_block(Prog1),
-	    print_bs(Bs),
-	    Prog1
+	_ ->
+	    Bs1 = optimise_bl(Bs0),
+	    Prog1 = bs_to_prog(Bs1),
+	    io:format("the program\n"),
+	    io:format("-----------\n"),
+	    print(Prog1),
+	    case validate(Prog1) of
+		E={error,_} -> E;
+		_ -> Prog1
+	    end
     end.
 
 
@@ -1124,13 +1606,12 @@ expr({p,X,K,4},Sp)  -> pexpr(ldiw,X,K,Sp);
 expr({p,X,K,2},Sp)  -> pexpr(ldih,X,K,Sp);
 expr({p,X,K,1},Sp)  -> pexpr(ldib,X,K,Sp);
 
-
 expr({'+',Ax,Bx},Sp) -> bop(addx,Ax,Bx,Sp);
 expr({'-',Ax,Bx},Sp) -> bop(subx,Ax,Bx,Sp);
 expr({'*',Ax,Bx},Sp) -> bop(mulx,Ax,Bx,Sp);
 expr({'/',Ax,Bx},Sp) -> bop(divx,Ax,Bx,Sp);
 expr({'&',Ax,Bx},Sp) -> bop(andx,Ax,Bx,Sp);
-expr({'|',Ax,Bx},Sp) -> bop(borx,Ax,Bx,Sp);
+expr({'|',Ax,Bx},Sp) -> bop(orx,Ax,Bx,Sp);
 expr({'<<',Ax,Bx},Sp) -> bop(lshx,Ax,Bx,Sp);
 expr({'>>',Ax,Bx},Sp) -> bop(rshx,Ax,Bx,Sp);
 expr({'-',Ax}, Sp)    -> uop(neg, Ax, Sp);
@@ -1142,8 +1623,45 @@ expr({'<=',Ax,Bx},Sp) -> rop(jgex,Bx,Ax,Sp);
 expr({'!=',Ax,Bx},Sp) -> lbool({'-',Ax,Bx},Sp);
 expr({'!',Ax},Sp)     -> lnot(Ax,Sp);
 expr({'&&',Ax,Bx},Sp) -> land(Ax,Bx,Sp);
-expr({'||',Ax,Bx},Sp) -> lor(Ax,Bx,Sp).
+expr({'&&',[]},Sp)    -> expr(true,Sp);
+expr({'&&',As},Sp) when is_list(As) -> expr(expr_list('&&',As), Sp);
+expr({'||',Ax,Bx},Sp) -> lor(Ax,Bx,Sp);
+expr({'||',[]},Sp)    -> expr(false,Sp);
+expr({'||',As},Sp) when is_list(As) -> expr(expr_list('||',As), Sp);
+expr({'memeq',Ax,Data},Sp) when is_binary(Data) ->
+    %% Ax is an index expression
+    {Sp1,Ac} = expr(Ax,Sp),
+    %% Move A to X
+    Jf = 2*((byte_size(Data)+3) div 4),  %% number of instructions
+    {Sp1,
+     [ Ac,    %% A = index
+       #bpf_insn { code=tax },          %% X=A index register
+       expr_memcmp(Data, 0, Jf),        %% Compare bytes P[X+0...X+N-1]
+       #bpf_insn { code=ldc, k=1 },     %% Jt: A=1
+       #bpf_insn { code=jmp, k=1 },     %% skip
+       #bpf_insn { code=ldc, k=0 },     %% Jf: A=0
+       #bpf_insn { code=sta, k=Sp1 }    %% Store bool value
+     ]}.  
 
+%% compare 
+expr_memcmp(<<X:32,Rest/binary>>, I, Jf) ->
+    [ #bpf_insn { code=ldiw, k=I },
+      #bpf_insn { code=jeqk, k=X, jt=0, jf=Jf } |
+      expr_memcmp(Rest, I+4, Jf-2)];
+expr_memcmp(<<X:16,Rest/binary>>, I, Jf) ->
+    [ #bpf_insn { code=ldih, k=I },
+      #bpf_insn { code=jeqk, k=X, jt=0, jf=Jf } |
+      expr_memcmp(Rest, I+2, Jf-2)];
+expr_memcmp(<<X:8>>, I, Jf) ->
+    [ #bpf_insn { code=ldib, k=I },
+      #bpf_insn { code=jeqk, k=X, jt=0, jf=Jf }];
+expr_memcmp(<<>>, _I, _Jf) ->
+    [].
+
+
+expr_list(_Op, [A]) -> A;
+expr_list(Op, [A|As]) -> {Op, A, expr_list(Op,As)}.
+    
 %% test if "true" == (jgtk > 0)
 
 %% Ax && Bx
@@ -1158,9 +1676,9 @@ land(Ax,Bx,Sp0) ->
       Bc,
       #bpf_insn { code=lda, k=Sp1 },  %% A = exp(Bx)
       #bpf_insn { code=jgtk, k=0, jt=0, jf=2 },
-      #bpf_insn { code=ldc, k=1 },        %% true value A=1
+      #bpf_insn { code=ldc, k=1 },        %% Jt: A=1
       #bpf_insn { code=jmp, k=1 },        %% skip
-      #bpf_insn { code=ldc, k=0 },        %% true value A=0
+      #bpf_insn { code=ldc, k=0 },        %% Jf: A=0
       #bpf_insn { code=sta, k=Sp1 }]}.
 
 %% Ax || Bx
@@ -1171,7 +1689,7 @@ lor(Ax,Bx,Sp0) ->
     {Sp1,
      [Ac,
       #bpf_insn { code=lda, k=Sp1 },      %% A = exp(Ax)
-      #bpf_insn { code=jgtk, k=0, jt=LBc+3, jf=0 },
+      #bpf_insn { code=jgtk, k=0, jt=LBc+5, jf=0 },
       Bc,
       #bpf_insn { code=lda, k=Sp1 },      %% A = exp(Bx)
       #bpf_insn { code=jgtk, k=0, jt=0, jf=2 },
@@ -1247,15 +1765,23 @@ aexpr(A, Sp0) ->
 	'ipv6'       -> iexpr(?ETHERTYPE_IPV6,Sp0);
 	'arp'        -> iexpr(?ETHERTYPE_ARP,Sp0);
 	'revarp'     -> iexpr(?ETHERTYPE_REVARP,Sp0);
-	%% packet access 
-	'eth.type'   -> expr({p,?OFFS_ETH_TYPE,2},Sp0);
 
+	%% ethernet
+	'eth.type'   -> expr({p,?OFFS_ETH_TYPE,2},Sp0);
+	'eth.type.ipv4' -> expr({'==','eth.type', 'ipv4'},Sp0);
+	'eth.type.ipv6' -> expr({'==','eth.type', 'ipv6'},Sp0);
+	'eth.type.arp'  -> expr({'==','eth.type', 'arp'},Sp0);
+	'eth.type.revarp' -> expr({'==','eth.type', 'revarp'},Sp0);
+	'eth.data'        -> iexpr(?OFFS_ETH_DATA,Sp0); %% (offset)
+	    
+	%% arp
 	'arp.htype'   -> expr({p,?OFFS_ARP_HTYPE,2},Sp0);
 	'arp.ptype'   -> expr({p,?OFFS_ARP_PTYPE,2},Sp0);
 	'arp.halen'   -> expr({p,?OFFS_ARP_HALEN,1},Sp0);
 	'arp.palen'   -> expr({p,?OFFS_ARP_PALEN,1},Sp0);
 	'arp.op'      -> expr({p,?OFFS_ARP_OP,2},Sp0);
 
+	%% ipv4
 	'ipv4.hlen'   -> pexpr(txa,{msh,?OFFS_IPV4_HLEN},0,Sp0);
 	'ipv4.diffsrv'  -> expr({p,?OFFS_IPV4_DSRV,1},Sp0);
 	'ipv4.len'      -> expr({p,?OFFS_IPV4_LEN,2},Sp0);
@@ -1265,20 +1791,28 @@ aexpr(A, Sp0) ->
 	'ipv4.frag' ->  expr({'&',{p,?OFFS_IPV4_FRAG,2},16#1FFF},Sp0);
 	'ipv4.ttl'   -> expr({p,?OFFS_IPV4_TTL,2},Sp0);
 	'ipv4.proto' -> expr({p,?OFFS_IPV4_PROTO,1},Sp0);
+	'ipv4.proto.tcp' -> expr({'==','ipv4.proto','tcp'},Sp0);
+	'ipv4.proto.udp' -> expr({'==','ipv4.proto','udp'},Sp0);
+	'ipv4.proto.icmp' -> expr({'==','ipv4.proto','icmp'},Sp0);
 	'ipv4.dst'   -> expr({p,?OFFS_IPV4_DST,4},Sp0);
 	'ipv4.src'   -> expr({p,?OFFS_IPV4_SRC,4},Sp0);
+	'ipv4.options' -> iexpr(?OFFS_IPV4_DATA, Sp0); %% (offset)
+	'ipv4.data'  -> expr({'+','eth.data','ipv4.hlen'}, Sp0);  %% (offset)
 
+	%% ipv6
 	'ipv6.len'   -> expr({p,?OFFS_IPV6_LEN,2},Sp0);
 	'ipv6.next'  -> expr({p,?OFFS_IPV6_NEXT,1},Sp0);
+	'ipv4.next.tcp' -> expr({'==','ipv6.next','tcp'},Sp0);
+	'ipv4.next.udp' -> expr({'==','ipv6.next','udp'},Sp0);
 	'ipv6.hopc'  -> expr({p,?OFFS_IPV6_HOPC,1},Sp0);
+	'ipv6.payload' -> iexpr(?OFFS_IPV6_PAYLOAD, Sp0);
 
-	%% TCP / UDP (currently only IPV4)
-
-	'ipv4.tcp.dst_port' -> 
+	%% tcp/ipv4
+	'ipv4.tcp' -> expr('ipv4.data', Sp0); %% (offset)
+	'ipv4.tcp.dst_port' ->
 	    expr({p,{msh,?OFFS_IPV4_HLEN},?XOFFS_TCP_DST_PORT,2},Sp0);
 	'ipv4.tcp.src_port' -> 
 	    expr({p,{msh,?OFFS_IPV4_HLEN},?XOFFS_TCP_SRC_PORT,2},Sp0);
-
 	'ipv4.tcp.seq' ->
 	    expr({p,{msh,?OFFS_IPV4_HLEN},?XOFFS_TCP_SEQ,4},Sp0);
 	'ipv4.tcp.ack' -> 
@@ -1298,7 +1832,13 @@ aexpr(A, Sp0) ->
 	'ipv4.tcp.flag.ack' -> expr({'&',{'>>','ipv4.tcp.flags',4},1}, Sp0);
 	'ipv4.tcp.flag.urg' -> expr({'&',{'>>','ipv4.tcp.flags',5},1}, Sp0);
 	'ipv4.tcp.data_offset' ->
-	    expr({'*',{'>>','ipv4.tcp.flags',12},4},Sp0);
+	    expr({'>>',{'&',{p,{msh,?OFFS_IPV4_HLEN},
+			     ?XOFFS_TCP_FLAGS,1},16#f0},2}, Sp0);
+	'ipv4.tcp.data' -> %% start of data in data packet (offset)
+	    expr({'+','ipv4.tcp.data_offset','ipv4.tcp'}, Sp0);
+
+	%% udp/ipv4
+	'ipv4.udp' -> expr('ipv4.data', Sp0); %% (offset)
 	'ipv4.udp.dst_port' -> 
 	    expr({p,{msh,?OFFS_IPV4_HLEN},?XOFFS_UDP_DST_PORT,2}, Sp0);
 	'ipv4.udp.src_port' ->
@@ -1307,7 +1847,11 @@ aexpr(A, Sp0) ->
 	    expr({p,{msh,?OFFS_IPV4_HLEN},?XOFFS_UDP_LENGTH,2}, Sp0);
 	'ipv4.udp.csum' ->
 	    expr({p,{msh,?OFFS_IPV4_HLEN},?XOFFS_UDP_CSUM,2}, Sp0);
+	'ipv4.udp.data' -> %% (offset to data)
+	    expr({'+','ipv4.hlen',?XOFFS_UDP_DATA}, Sp0);
 
+	%% tcp/ipv6
+	'ipv6.tcp' -> expr('ipv6.payload', Sp0); %% (offset)
 	'ipv6.tcp.dst_port' -> 
 	    expr({p,?OFFS_IPV6_PAYLOAD+?OFFS_TCP_DST_PORT,2},Sp0);
 	'ipv6.tcp.src_port' -> 
@@ -1331,8 +1875,11 @@ aexpr(A, Sp0) ->
 	'ipv6.tcp.flag.ack' -> expr({'&',{'>>','ipv6.tcp.flags',4},1}, Sp0);
 	'ipv6.tcp.flag.urg' -> expr({'&',{'>>','ipv6.tcp.flags',5},1}, Sp0);
 	'ipv6.tcp.data_offset' ->
-	    expr({'*',{'>>','ipv6.tcp.flags',12},4},Sp0);
-
+	    expr({'>>',{'&',
+			{p,?OFFS_IPV6_PAYLOAD+?OFFS_TCP_FLAGS,1},16#f0},2},Sp0);
+	'ipv6.tcp.data' -> %% start of data in data packet (offset)
+	    expr({'+','ipv6.tcp.data_offset','ipv6.tcp'}, Sp0);
+	%% udp/ipv6
 	'ipv6.udp.dst_port' -> 
 	    expr({p,?OFFS_IPV6_PAYLOAD+?OFFS_UDP_DST_PORT,2}, Sp0);
 	'ipv6.udp.src_port' ->
@@ -1521,3 +2068,152 @@ if_opk(Op,K,True,False) ->
 
 code_length(Code) ->
     lists:flatlength(Code).
+
+%%
+%% Basic block representation
+%%  bpf_bprog {
+%%     fanout:  dict L -> [L]
+%%     fanin:   dict L -> [L]
+%%     block:   dict L -> #bpf_block
+%%  }
+%%
+
+bs_new() ->
+    #bpf_bs {
+       changed = 0,
+       block  = dict:new(),
+       fanin  = dict:new(),
+       fanout = dict:new()
+      }.
+
+bs_map_block(Fun, Bs) when is_record(Bs,bpf_bs) ->
+    Ls = [L || {L,_B} <- dict:to_list(Bs#bpf_bs.block)],
+    bs_map_(Fun, Bs, Ls).
+
+bs_map_(Fun, Bs, [I|Is]) ->
+    B = bs_get_block(I, Bs),
+    case Fun(B) of
+	B  -> bs_map_(Fun, Bs, Is);
+	B1 -> bs_map_(Fun, bs_set_block(B1,Bs),Is)
+    end;
+bs_map_(_Fun,Bs,[]) ->
+    Bs.
+
+bs_each_block(Fun, Bs) when is_record(Bs,bpf_bs) ->
+    Ls = [B || {_L,B} <- dict:to_list(Bs#bpf_bs.block)],
+    lists:foreach(Fun, lists:keysort(#bpf_block.label, Ls)).
+
+bs_fold_block(Fun, Acc, Bs) when is_record(Bs,bpf_bs) ->
+    dict:fold(fun(_K,B,AccIn) -> Fun(B,AccIn) end, Acc, Bs#bpf_bs.block).
+
+bs_set_block(B, Bs) when is_record(B,bpf_block), is_record(Bs,bpf_bs) ->
+    case dict:fetch(B#bpf_block.label, Bs#bpf_bs.block) of
+	B -> Bs;  %% no changed
+	_ ->
+	    Bs1 = bs_del_block(B#bpf_block.label, Bs),
+	    bs_add_block(B, Bs1)
+    end.
+    
+bs_add_block(B, Bs) when is_record(B,bpf_block), is_record(Bs,bpf_bs) ->
+    La = B#bpf_block.label,
+    Block = dict:store(La, B, Bs#bpf_bs.block),
+    Bs1 = Bs#bpf_bs { block = Block, changed=Bs#bpf_bs.changed+1 },
+    foldl(fun(Lb,Bsi) -> bs_add_edge(La, Lb, Bsi) end, Bs1,
+	  get_fanout(B#bpf_block.next)).
+
+bs_del_block(La, Bs) when is_record(Bs,bpf_bs) ->
+    B = dict:fetch(La, Bs#bpf_bs.block),
+    Block = dict:erase(La, Bs#bpf_bs.block),
+    Bs1 = Bs#bpf_bs { block=Block, changed=Bs#bpf_bs.changed+1 },
+    foldl(fun(Lb,Bsi) -> bs_del_edge(La, Lb, Bsi) end, Bs1,
+	  get_fanout(B#bpf_block.next)).
+    
+bs_set_next(La, Next, Bs) when is_record(Next,bpf_insn), is_record(Bs,bpf_bs) ->
+    B = dict:fetch(La, Bs#bpf_bs.block),
+    Next0 = B#bpf_block.next,
+    if Next =:= Next0 ->
+	    Bs;
+       true ->
+	    Ldel = get_fanout(Next0),
+	    Ladd = get_fanout(Next),
+	    B1 = B#bpf_block { next = Next },
+	    Block = dict:store(La, B1, Bs#bpf_bs.block),
+	    Bs1 = Bs#bpf_bs { block = Block, changed=Bs#bpf_bs.changed+1 },
+	    Bs2 = foldl(fun(Lb,Bsi) -> bs_add_edge(La, Lb, Bsi) end, Bs1, Ladd),
+	    Bs3 = foldl(fun(Lb,Bsi) -> bs_del_edge(La, Lb, Bsi) end, Bs2, Ldel),
+	    Bs3
+    end.
+
+bs_set_insns(La, Insns, Bs) when is_list(Insns), is_record(Bs, bpf_bs) ->
+    B = dict:fetch(La, Bs#bpf_bs.block),
+    Insns0 = B#bpf_block.insns,
+    if Insns0 =:= Insns ->
+	    Bs;
+       true ->
+	    B1 = B#bpf_block { insns = Insns },
+	    Block = dict:store(La, B1, Bs#bpf_bs.block),
+	    Bs#bpf_bs { block = Block, changed=Bs#bpf_bs.changed+1 }
+    end.
+
+bs_get_block(La, Bs) when is_record(Bs, bpf_bs) ->
+    dict:fetch(La, Bs#bpf_bs.block).
+
+bs_get_labels(Bs) when is_record(Bs, bpf_bs) ->
+    dict:fold(fun(K,_,Acc) -> [K|Acc] end, [], Bs#bpf_bs.block).
+
+bs_get_next(La, Bs) when is_record(Bs, bpf_bs) ->
+    B = dict:fetch(La, Bs#bpf_bs.block),
+    B#bpf_block.next.
+
+bs_get_insns(La, Bs) when is_record(Bs, bpf_bs) ->
+    B = dict:fetch(La, Bs#bpf_bs.block),
+    B#bpf_block.insns.    
+
+bs_get_fanout(L, Bs) when is_record(Bs, bpf_bs) ->
+    case dict:find(L, Bs#bpf_bs.fanout) of
+	error -> [];
+	{ok,Ls} -> Ls
+    end.
+
+bs_get_fanin(L, Bs) when is_record(Bs, bpf_bs) ->
+    case dict:find(L, Bs#bpf_bs.fanin) of
+	error -> [];
+	{ok,Ls} -> Ls
+    end.
+
+%% add edge La -> Lb
+bs_add_edge(La,Lb,Bs) ->
+    Fo = dict:append(La, Lb, Bs#bpf_bs.fanout),   %% La -> Lb
+    Fi = dict:append(Lb, La, Bs#bpf_bs.fanin),    %% Lb <- La
+    Bs#bpf_bs { fanout = Fo, fanin = Fi }.
+
+%% del edge La -> Lb
+bs_del_edge(La,Lb,Bs) ->
+    Fo = dict_subtract(La, Lb, Bs#bpf_bs.fanout),   %% La -> Lb
+    Fi = dict_subtract(Lb, La, Bs#bpf_bs.fanin),    %% Lb <- La
+    Bs#bpf_bs { fanout = Fo, fanin = Fi }.
+
+%% subtract V from list in key K
+dict_subtract(K,V,D) ->
+    case dict:find(K, D) of
+	error -> D;
+	{ok,L} when is_list(L) ->
+	    case L -- [V] of
+		[] -> dict:erase(K,D);
+		L1 -> dict:store(K,L1,D)
+	    end
+    end.
+
+%% return a list of output labels.
+%% #bpf_insn{} => [label()]
+%%
+get_fanout(I=#bpf_insn { jt=Jt, jf=Jf, k=K }) ->
+    case class(I) of
+	{jmp,true,_} -> [K];
+	{jmp,_Cond,_R} -> [Jt,Jf];
+	_ -> []
+    end;
+get_fanout(undefined) ->
+    [].
+
+	    

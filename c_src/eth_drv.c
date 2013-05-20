@@ -28,7 +28,8 @@
 #endif
 
 #include "erl_driver.h"
-// #include "dthread.h"
+
+#include "eth_bpf.h"
 
 #define ATOM(NAME) am_ ## NAME
 #define INIT_ATOM(NAME) am_ ## NAME = driver_mk_atom(#NAME)
@@ -43,16 +44,27 @@ typedef int  ErlDrvSSizeT;
 
 #define INT_EVENT(e) ((int)((long)(e)))
 
+typedef struct _eth_sub_t
+{
+    ErlDrvTermData  pid;    // the process 
+    ErlDrvMonitor   mon;    // the monitor
+    int32_t         active; // packet active mode/count
+    uint32_t        plen;   // program len
+    uint8_t*        prog;   // BPF program (driver_alloc)
+    struct _eth_sub_t* next;
+} eth_sub_t;
+
 typedef struct _eth_ctx_t
 {
     ErlDrvPort  port;
     ErlDrvEvent fd;
+    ErlDrvTermData owner;         // port owner
     char*       if_name;       // interface name
     int         if_index;      // interface index
     int         is_selecting;  // driver select in use
-    int         active;        // number of packets remain to process
+    int         nactive;       // number of active subs
     ErlDrvTermData dport;
-    ErlDrvTermData target;
+    eth_sub_t*     first;
     void*          ibuf;
     size_t         ibuflen;
 } eth_ctx_t;
@@ -62,6 +74,7 @@ typedef struct _eth_ctx_t
 #define CMD_ACTIVE 3
 #define CMD_SETF   4
 #define CMD_DEBUG  5
+#define CMD_SUBF   6
 
 static inline uint32_t get_uint32(uint8_t* ptr)
 {
@@ -115,12 +128,17 @@ static void eth_drv_ready_output(ErlDrvData data, ErlDrvEvent event);
 static ErlDrvData eth_drv_start(ErlDrvPort, char* command);
 static ErlDrvSSizeT eth_drv_ctl(ErlDrvData,unsigned int,char*,ErlDrvSizeT,char**, ErlDrvSizeT);
 static void eth_drv_timeout(ErlDrvData);
+static void eth_drv_process_exit(ErlDrvData,ErlDrvMonitor *);
 static void eth_drv_stop_select(ErlDrvEvent, void*);
+
 
 ErlDrvTermData am_ok;
 ErlDrvTermData am_error;
 ErlDrvTermData am_undefined;
+ErlDrvTermData am_true;
+ErlDrvTermData am_false;
 ErlDrvTermData am_eth_frame;
+ErlDrvTermData am_eth_active;
 
 #define push_atom(atm) do {			\
 	message[i++] = ERL_DRV_ATOM;		\
@@ -130,6 +148,11 @@ ErlDrvTermData am_eth_frame;
 #define push_port(prt) do {			\
 	message[i++] = ERL_DRV_PORT;		\
 	message[i++] = (prt);			\
+    } while(0)
+
+#define push_pid(pid) do {			\
+	message[i++] = ERL_DRV_PID;		\
+	message[i++] = (pid);			\
     } while(0)
 
 #define push_bin(buf,len) do {			\
@@ -241,6 +264,47 @@ static ErlDrvSSizeT ctl_reply(int rep, char* buf, ErlDrvSizeT len,
     memcpy(ptr, buf, len);
     return len+1;
 }
+
+
+static eth_sub_t** find_sub(eth_ctx_t* ctx, ErlDrvTermData pid)
+{
+    eth_sub_t** pptr = &ctx->first;
+
+    while(*pptr) {
+	if ((*pptr)->pid == pid)
+	    return pptr;
+	pptr = &(*pptr)->next;
+    }
+    return NULL;
+}
+
+
+//
+// find or create a subscription record 
+// setup a monitor if needed 
+//
+static eth_sub_t** find_or_create_sub(eth_ctx_t* ctx, ErlDrvTermData pid)
+{
+    eth_sub_t*  ptr;
+    eth_sub_t** pptr;
+    ErlDrvMonitor mon;
+
+    if ((pptr = find_sub(ctx, pid)) != NULL)
+	return pptr;
+    if (driver_monitor_process(ctx->port, pid, &mon) < 0)
+	return NULL;
+    if ((ptr = driver_alloc(sizeof(eth_sub_t))) == NULL) {
+	driver_demonitor_process(ctx->port, &mon);
+	return NULL;
+    }
+    memset(ptr, 0, sizeof(eth_sub_t));
+    ptr->pid = pid;
+    ptr->mon = mon;
+    ptr->next = ctx->first;
+    ctx->first = ptr;
+    return &ctx->first;
+}
+
 
 static int open_device()
 {
@@ -479,24 +543,71 @@ static void make_arp_packet(eth_ctx_t* ctx)
 }
 #endif
 
+static int deliver_active(eth_ctx_t* ctx, ErlDrvTermData pid, int is_active)
+{
+    ErlDrvTermData message[16];
+    int i = 0;
+    // {eth_active, <port>, <pid>, <bool>}
+    push_atom(ATOM(eth_active));
+    push_port(ctx->dport);
+    push_pid(pid);
+    push_atom(is_active ? ATOM(true) : ATOM(false));
+    push_tuple(4);
+    return driver_send_term(ctx->port, ctx->owner, message, i);
+}
+
+
+static int deliver_frame(eth_ctx_t* ctx, uint8_t* p, uint32_t len)
+{
+    eth_sub_t* ptr;
+    ErlDrvTermData message[16];
+    int i = 0;
+    int bpf_err;
+    uint32_t bpf_err_loc;
+
+    // {eth_frame, <port>, <index>, <data>}
+    push_atom(ATOM(eth_frame));
+    push_port(ctx->dport);
+    push_int(ctx->if_index);
+    push_bin((char*)p, len);
+    push_tuple(4);
+
+    ptr = ctx->first;
+    while(ptr != NULL) {
+	if (ptr->active != 0) {
+	    if (eth_bpf_exec(ptr->prog, ptr->plen, p, len, 
+			     &bpf_err, &bpf_err_loc)) {
+		driver_send_term(ctx->port, ptr->pid, message, i);
+		if (ptr->active > 0)
+		    ptr->active--;
+		if (ptr->active == 0) {
+		    deliver_active(ctx, ptr->pid, 0);
+		    ctx->nactive--;
+		    if (ctx->nactive == 0) {
+			if (ctx->is_selecting) {
+			    driver_select(ctx->port, ctx->fd, ERL_DRV_READ, 0);
+			    ctx->is_selecting = 0;
+			}
+		    }
+		}
+	    }
+	    else if (bpf_err != ETH_BPF_OK) {
+		DEBUGF("bpf_exec failed %s @%d", 
+		       eth_bpf_strerr(bpf_err), bpf_err_loc);
+	    }
+	}
+	ptr = ptr->next;
+    }
+    return 0;
+}
+
 static int input_frame(eth_ctx_t* ctx)
 {
 #if defined(__linux__)
     int n;
     if ((n = read(INT_EVENT(ctx->fd), ctx->ibuf, ctx->ibuflen)) > 0) {
-	ErlDrvTermData message[16];
-	int i = 0;
-	int j;
-	// {eth_frame, <port>, <index>, <data>}
-	push_atom(ATOM(eth_frame));
-	push_port(ctx->dport);
-	push_int(ctx->if_index);
-	push_bin((char*)ctx->ibuf, n);
-	push_tuple(4);
-	j = driver_send_term(ctx->port, ctx->target, message, i);
-	DEBUGF("input_frame %d bytes, %d words, %d status", n, i, j);
-	if (ctx->active > 0)
-	    ctx->active--;
+
+	send_frame(ctx, ctx->ibuf, n);
     }
     else if (n < 0) {
 	DEBUGF("input_frame recvfrom failed %s", strerror(errno));
@@ -517,19 +628,7 @@ static int input_frame(eth_ctx_t* ctx)
 	    
 	    if ((p->bh_caplen == p->bh_datalen) &&
 		(data+p->bh_caplen <= ptr_end)) {
-		ErlDrvTermData message[16];
-		int i = 0;
-		int j;
-		// {eth_frame, <port>, <index>, <data>}
-		push_atom(ATOM(eth_frame));
-		push_port(ctx->dport);
-		push_int(ctx->if_index);
-		push_bin(data, p->bh_caplen);
-		push_tuple(4);
-		j=driver_send_term(ctx->port, ctx->target, message, i);
-		DEBUGF("input_frame %d bytes, %d words, %d status", n, i, j);
-		if (ctx->active > 0)
-		    ctx->active--;
+		deliver_frame(ctx, (uint8_t*)data, p->bh_caplen);
 	    }
 	    ptr += BPF_WORDALIGN(p->bh_hdrlen + p->bh_caplen);
 	}
@@ -553,7 +652,10 @@ static int eth_drv_init(void)
     INIT_ATOM(ok);
     INIT_ATOM(error);
     INIT_ATOM(undefined);
+    INIT_ATOM(true);
+    INIT_ATOM(false);
     INIT_ATOM(eth_frame);
+    INIT_ATOM(eth_active);
     return 0;
 }
 
@@ -582,7 +684,7 @@ static ErlDrvData eth_drv_start(ErlDrvPort port, char* command)
 
     ctx->port         = port;
     ctx->dport        = driver_mk_port(port);
-    ctx->target       = driver_caller(port);
+    ctx->owner        = driver_connected(port);
     ctx->fd           = (ErlDrvEvent)fd;
     ctx->if_index     = -1;
 
@@ -618,6 +720,8 @@ static ErlDrvSSizeT eth_drv_ctl(ErlDrvData d,
 {
     uint8_t* buf = (uint8_t*) buf0;
     eth_ctx_t* ctx = (eth_ctx_t*) d;
+    int bpf_err;
+    uint32_t bpf_err_loc;
 
     DEBUGF("eth_drv: ctl: cmd=%u, len=%d", cmd, len);
 
@@ -648,33 +752,83 @@ static ErlDrvSSizeT eth_drv_ctl(ErlDrvData d,
 	}
 	goto ok;
 	    
-    case CMD_ACTIVE: { // <<n:32/signed>>
-	if (len != 4) goto badarg;
-	if (ctx->if_index < 0) goto badarg;
-	ctx->active = get_int32(buf);
-	if (ctx->active == 0) { // disable
-	    if (ctx->is_selecting) {
-		driver_select(ctx->port, ctx->fd, ERL_DRV_READ, 0);
-		ctx->is_selecting = 0;
-	    }
-	}
-	else { // enable
-	    ctx->target = driver_caller(ctx->port);
-	    if (!ctx->is_selecting) {
-		driver_select(ctx->port, ctx->fd, ERL_DRV_READ, 1);
-		ctx->is_selecting = 1;
-	    }
-	}
-	goto ok;
-    }
-
+	// Global filter
     case CMD_SETF: {  // N*<<code:16,jt:8,jl:8,k:32>>
 	if ((len & 7) != 0) goto badarg;  // must be multiple of 8
 	if (set_bpf(ctx, buf, len) < 0)
 	    goto error;
 	goto ok;
     }
-	
+
+	// Set local active
+    case CMD_ACTIVE: { // <<n:32/signed>>
+	eth_sub_t** pptr;
+	eth_sub_t* ptr;
+	int32_t active;
+	if (len != 4) 
+	    goto badarg;
+	if (ctx->if_index < 0) 
+	    goto badarg;
+	if ((pptr = find_or_create_sub(ctx, driver_caller(ctx->port)))==NULL) {
+	    errno = ENOMEM;
+	    goto error;
+	}
+	ptr = *pptr;
+	active = ptr->active;
+	ptr->active = get_int32(buf);
+
+	if ((active == 0) && (ptr->active != 0)) {
+	    deliver_active(ctx, ptr->pid, 1);
+	    ctx->nactive++;
+	    if (!ctx->is_selecting) {
+		driver_select(ctx->port, ctx->fd, ERL_DRV_READ, 1);
+		ctx->is_selecting = 1;
+	    }
+	}
+	else if ((active != 0) && (ptr->active == 0)) {
+	    deliver_active(ctx, ptr->pid, 0);
+	    ctx->nactive--;
+	    if (ctx->nactive == 0) { // disable
+		if (ctx->is_selecting) {
+		    driver_select(ctx->port, ctx->fd, ERL_DRV_READ, 0);
+		    ctx->is_selecting = 0;
+		}
+	    }
+	}
+	goto ok;
+    }
+
+	// Create or update subscription
+    case CMD_SUBF: {
+	eth_sub_t** pptr;
+	eth_sub_t* ptr;
+	uint8_t* prog;
+	uint32_t plen;
+	if ((len & 7) != 0) // must be multiple of 8
+	    goto badarg;
+	if (len == 0)
+	    prog = NULL;
+	else if ((prog = driver_alloc(len)) == NULL)
+	    goto error;
+	plen = len >> 3;
+	if (!eth_bpf_validate(buf, prog, plen, &bpf_err, &bpf_err_loc)) {
+	    driver_free(prog);
+	    goto bpf_error;
+	}
+	if ((pptr=find_or_create_sub(ctx, driver_caller(ctx->port)))==NULL) {
+	    if (prog)
+		driver_free(prog);
+	    errno = ENOMEM;
+	    goto error;
+	}
+	ptr = *pptr;
+	if (ptr->prog != NULL)
+	    driver_free(ptr->prog);
+	ptr->prog = prog;
+	ptr->plen = plen;
+	goto ok;
+    }
+
     case CMD_DEBUG: {
 	if (len != 1) goto badarg;
 	debug_level = get_int8(buf);
@@ -688,11 +842,15 @@ ok:
     return ctl_reply(0, NULL, 0, rbuf, rsize);
 badarg:
     errno = EINVAL;
-error:
-    {
-        char* err_str = erl_errno_id(errno);
-	return ctl_reply(255, err_str, strlen(err_str), rbuf, rsize);
-    }
+error: {
+    char* err_str = erl_errno_id(errno);
+    return ctl_reply(255, err_str, strlen(err_str), rbuf, rsize);
+}
+bpf_error: {
+    char* err_str = eth_bpf_strerr(bpf_err);
+    return ctl_reply(254, err_str, strlen(err_str), rbuf, rsize);
+}
+
 }
 
 
@@ -727,16 +885,10 @@ static void eth_drv_ready_input(ErlDrvData d, ErlDrvEvent e)
 {
     eth_ctx_t* ctx = (eth_ctx_t*) d;
 
-    DEBUGF("eth_drv: ready_input called active = %d", ctx->active);
+    DEBUGF("eth_drv: ready_input called nactive = %d", ctx->nactive);
 
-    if (ctx->fd == e) {
-	if (input_frame(ctx) < 0)
-	    return;
-	if (ctx->active == 0) {
-	    driver_select(ctx->port, ctx->fd, ERL_DRV_READ, 0);
-	    ctx->is_selecting = 0;
-	}
-    }
+    if (ctx->fd == e)
+	input_frame(ctx);
 }
 
 static void eth_drv_ready_output(ErlDrvData d, ErlDrvEvent e)
@@ -759,6 +911,31 @@ static void eth_drv_stop_select(ErlDrvEvent event, void* arg)
     (void) arg;
     DEBUGF("eth_drv: stop_select event=%d", INT_EVENT(event));
     close(INT_EVENT(event));
+}
+
+static void eth_drv_process_exit(ErlDrvData d, ErlDrvMonitor *mon)
+{
+    eth_ctx_t* ctx = (eth_ctx_t*) d;
+    ErlDrvTermData pid;
+    pid = driver_get_monitored_process(ctx->port, mon);
+    if (pid != driver_term_nil) {
+	eth_sub_t** pptr = find_sub(ctx, pid);
+	if (pptr != NULL) {
+	    eth_sub_t* ptr = *pptr;
+	    *pptr = ptr->next;
+	    if (ptr->active != 0) {
+		deliver_active(ctx, ptr->pid, 0);
+		ctx->nactive--;
+		if (ctx->nactive == 0) {
+		    driver_select(ctx->port, ctx->fd, ERL_DRV_READ, 0);
+		    ctx->is_selecting = 0;
+		}
+	    }
+	    if (ptr->prog)
+		driver_free(ptr->prog);
+	    driver_free(ptr);
+	}
+    }
 }
 
 DRIVER_INIT(eth_drv)
@@ -786,7 +963,7 @@ DRIVER_INIT(eth_drv)
     ptr->major_version = ERL_DRV_EXTENDED_MAJOR_VERSION;
     ptr->minor_version = ERL_DRV_EXTENDED_MINOR_VERSION;
     ptr->driver_flags = ERL_DRV_FLAG_USE_PORT_LOCKING;
-    ptr->process_exit = 0;
+    ptr->process_exit = eth_drv_process_exit;
     ptr->stop_select = eth_drv_stop_select;
     return ptr;
 }

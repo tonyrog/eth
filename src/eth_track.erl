@@ -1,30 +1,28 @@
 %%% @author Tony Rogvall <tony@rogvall.se>
 %%% @copyright (C) 2013, Tony Rogvall
 %%% @doc
-%%%     tcpdump rip off
+%%%     TCP connection tracking
 %%% @end
 %%% Created :  7 May 2013 by Tony Rogvall <tony@rogvall.se>
 
--module(eth_dump).
+-module(eth_track).
 
 -behaviour(gen_server).
 
 %% API
 -export([start_link/1]).
+-export([stop/1, dump/1]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
 	 terminate/2, code_change/3]).
-
--export([set_filter/2, set_active/2, set_active_time/2, set_style/2, stop/1]).
 
 -include_lib("enet/include/enet_types.hrl").
 
 -record(state, 
 	{
 	  eth,
-	  tref = undefined :: undefined | reference(), %% timer ref
-	  style = json :: json|yang|erlang %%  (c...)
+	  con
 	}).
 
 %%%===================================================================
@@ -45,27 +43,9 @@ start_link(Interface) when is_list(Interface) ->
 stop(Pid) ->
     gen_server:call(Pid, stop).
 
-%% only do statistic on what match the filter!
-set_filter(Pid, Prog) when is_pid(Pid), is_tuple(Prog) ->
-    Filter = eth_bpf:encode(Prog),
-    gen_server:call(Pid, {set_filter, Filter}).
+dump(Pid) ->
+    gen_server:call(Pid, dump).
 
-%% set output style
-set_style(Pid, Style) when is_pid(Pid), is_atom(Style) ->
-    gen_server:call(Pid, {set_style, Style}).
-
-%% controls how many packets that should be handled:
-%% -1 = unlimited
-%%  0 = off
-%%  N = count
-%%
-set_active(Pid, N) when is_integer(N), N >= -1 ->
-    gen_server:call(Pid, {set_active, N}).
-
-%%  0  = cancel time logging
-%%  T  = log packets for T milliseconds
-set_active_time(Pid, T) when is_integer(T), T >= 0 ->
-    gen_server:call(Pid, {set_active_time, T}).
 
 %%%===================================================================
 %%% gen_server callbacks
@@ -85,7 +65,18 @@ set_active_time(Pid, T) when is_integer(T), T >= 0 ->
 init([Interface]) ->
     case eth_devices:open(Interface) of
 	{ok,Port} ->
-	    {ok, #state { eth = Port }};
+	    T = ets:new(contrack, []),
+	    Prog = eth_bpf:build_programx({'||', 
+					   connect_filter(),
+					   disconnect_filter()}),
+	    Filter = eth_bpf:encode(Prog),
+	    case eth_devices:set_filter(Port, Filter) of
+		ok ->
+		    eth_devices:set_active(Port, -1),
+		    {ok, #state { eth = Port, con=T }};
+		Error ->
+		    {stop, Error}
+	    end;
 	Error ->
 	    {stop, Error}
     end.
@@ -104,43 +95,11 @@ init([Interface]) ->
 %%                                   {stop, Reason, State}
 %% @end
 %%--------------------------------------------------------------------
-handle_call({set_active,N}, _From, State) ->
-    if State#state.tref =:= undefined ->
-	    Reply = eth_devices:set_active(State#state.eth, N),
-	    {reply, Reply, State};
-       N =:= 0 -> %% disable log
-	    cancel_timer(State#state.tref),
-	    eth_devices:set_active(State#state.eth, 0),
-	    flush_frames(),
-	    {reply, ok, State#state { tref=undefined} };
-       true -> %% using time 
-	    {reply, {error,einprogress}, State}
-    end;
-handle_call({set_active_time,T}, _From, State) ->
-    TRef = if T =:= 0 ->
-		   cancel_timer(State#state.tref),
-		   eth_devices:set_active(State#state.eth, 0),
-		   flush_frames(),
-		   undefined;
-	      true ->
-		   cancel_timer(State#state.tref),
-		   eth_devices:set_active(State#state.eth, -1),
-		   erlang:start_timer(T, self(), deactivate)
-	   end,
-    {reply, ok, State#state { tref = TRef }};
-handle_call({set_filter,Filter}, _From, State) ->
-    Reply = eth_devices:set_filter(State#state.eth, Filter),
-    %% flush frames from old filter. Maybe some to the new as well ..
-    flush_frames(),
-    {reply, Reply, State};
-handle_call({set_style,Style}, _From, State) ->
-    if Style =:= json;
-       Style =:= yang;
-       Style =:= erlang ->
-	    {reply, ok, State#state { style=Style}};
-       true ->
-	    {reply, {error, einval}, State}
-    end;
+handle_call(dump, _From, State) ->
+    ets:foldl(fun(V,_) ->
+		      io:format("~w\n", [V])
+	      end, ok, State#state.con),
+    {reply, ok, State};
 handle_call(stop, _From, State) ->
     {stop, normal, ok, State};
 handle_call(_Request, _From, State) ->
@@ -173,24 +132,26 @@ handle_cast(_Msg, State) ->
 handle_info({eth_frame,_Port,_IfIndex,Data}, State) ->
     try eth_packet:decode(Data, [{decode_types,all},nolookup]) of
 	Eth ->
-	    io:format("~p\n", [Data]),
-	    try dump(Eth, State#state.style) of
-		ok -> ok
-	    catch
-		error:Reason ->
-		    io:format("crash: ~p\n  ~p\n", 
-			      [Reason,erlang:get_stacktrace()])
-	    end
+	    IPv4 = Eth#eth.data,
+	    Tcp  = IPv4#ipv4.data,
+	    if Tcp#tcp.syn, Tcp#tcp.ack ->
+		    Key = {IPv4#ipv4.src, IPv4#ipv4.dst,
+			   Tcp#tcp.src_port, Tcp#tcp.dst_port},
+		    ets:insert(State#state.con, {Key,true});
+	       Tcp#tcp.fin, Tcp#tcp.ack ->
+		    Key = {IPv4#ipv4.src, IPv4#ipv4.dst,
+			   Tcp#tcp.src_port, Tcp#tcp.dst_port},
+		    ets:delete(State#state.con, Key);
+	       true ->
+		    ignore
+	    end,
+	    {noreply, State}
     catch
 	error:Reason ->
 	    io:format("crash: ~p\n  ~p\n",
-		      [Reason,erlang:get_stacktrace()])
-    end,
-    {noreply, State};
-handle_info({timeout,TRef, deactivate}, State) when TRef =:= State#state.tref ->
-    eth:active(State#state.eth, 0),
-    flush_frames(),
-    {noreply, State#state { tref = undefined }};
+		      [Reason,erlang:get_stacktrace()]),
+	    {noreply, State}
+    end;
 handle_info(_Info, State) ->
     {noreply, State}.
 
@@ -223,29 +184,18 @@ code_change(_OldVsn, State, _Extra) ->
 %%% Internal functions
 %%%===================================================================
 
-flush_frames() ->
-    receive
-	{eth_frame,_Port,_IfIndex,_Data} ->
-	    flush_frames()
-    after 0 ->
-	    ok
-    end.
+%% TCP - SYN/ACK => established
+connect_filter() ->
+    {'&&', ['eth.type.ipv4',
+	    'ipv4.proto.tcp',
+	    {'==','ipv4.frag',0},
+	    'ipv4.tcp.flag.syn',
+	    'ipv4.tcp.flag.ack']}.
 
-cancel_timer(undefined) ->
-    ok;
-cancel_timer(TRef) ->
-    erlang:cancel_timer(TRef),
-    receive 
-	{timeout, TRef, _} ->
-	    ok
-    after 0 ->
-	    ok
-    end.
-
-
-dump(Eth, json) ->
-    eth_packet:dump_json(Eth);
-dump(Eth, yang) ->
-    eth_packet:dump_yang(Eth);
-dump(Eth, erlang) -> %% fixme add erlang record variant!
-    io:format("~p\n", [Eth]).
+%% TCP - FIN/ACK => disconnected
+disconnect_filter() ->
+    {'&&', ['eth.type.ipv4',
+	    'ipv4.proto.tcp',
+	    {'==','ipv4.frag',0},
+	    'ipv4.tcp.flag.fin',
+	    'ipv4.tcp.flag.ack']}.
