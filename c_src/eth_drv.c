@@ -610,7 +610,7 @@ static int input_frame(eth_ctx_t* ctx)
     int n;
     if ((n = read(INT_EVENT(ctx->fd), ctx->ibuf, ctx->ibuflen)) > 0) {
 
-	send_frame(ctx, ctx->ibuf, n);
+	deliver_frame(ctx, ctx->ibuf, n);
     }
     else if (n < 0) {
 	DEBUGF("input_frame recvfrom failed %s", strerror(errno));
