@@ -5,15 +5,31 @@ OPTIMISATION RULES
 
 ## 1a.
 
-    M[<k>]=A, A=M[<k>];   ==>  M[<k>] = A
+    L0: sta <k>
+        lda <k>
+=>
+
+    L0: sta <k>
     
 ## 1b.
 
-    A=X, M[<k>]=A;  ==> A=X, M[<k>]=X
+    L0: txa
+        lda <k>
+
+==>
+
+    L0: txa
+        ldx <k>
 
 ## 1c.
 
-    M[<k>]=A, X=M[<k>] => M[<k>]=A, X=A;
+    L0: sta <k>
+        ldx <k>
+
+=>
+
+    L0: sta <k>
+        tax
 
 ## 1d.
 
