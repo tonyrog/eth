@@ -549,7 +549,7 @@ static int get_bpf_stat(eth_ctx_t* ctx, uint32_t stat[2])
     stat[1] = bst.bs_drop;
     return 0;
 #else
-    return -1M
+    return -1;
 #endif
 }
 //
