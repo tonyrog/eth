@@ -106,11 +106,11 @@ init([Interface]) ->
 %%--------------------------------------------------------------------
 handle_call({set_active,N}, _From, State) ->
     if State#state.tref =:= undefined ->
-	    Reply = eth_devices:set_active(State#state.eth, N),
+	    Reply = eth:set_active(State#state.eth, N),
 	    {reply, Reply, State};
        N =:= 0 -> %% disable log
 	    cancel_timer(State#state.tref),
-	    eth_devices:set_active(State#state.eth, 0),
+	    eth:set_active(State#state.eth, 0),
 	    flush_frames(),
 	    {reply, ok, State#state { tref=undefined} };
        true -> %% using time 
@@ -119,17 +119,17 @@ handle_call({set_active,N}, _From, State) ->
 handle_call({set_active_time,T}, _From, State) ->
     TRef = if T =:= 0 ->
 		   cancel_timer(State#state.tref),
-		   eth_devices:set_active(State#state.eth, 0),
+		   eth:set_active(State#state.eth, 0),
 		   flush_frames(),
 		   undefined;
 	      true ->
 		   cancel_timer(State#state.tref),
-		   eth_devices:set_active(State#state.eth, -1),
+		   eth:set_active(State#state.eth, -1),
 		   erlang:start_timer(T, self(), deactivate)
 	   end,
     {reply, ok, State#state { tref = TRef }};
 handle_call({set_filter,Filter}, _From, State) ->
-    Reply = eth_devices:set_filter(State#state.eth, Filter),
+    Reply = eth:set_filter(State#state.eth, Filter),
     %% flush frames from old filter. Maybe some to the new as well ..
     flush_frames(),
     {reply, Reply, State};

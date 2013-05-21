@@ -15,9 +15,11 @@
 -export([open/1, close/1, find/1, debug/2]).
 -export([set_filter/3, get_address/1]).
 -export([get_list/0, i/0]).
+-export([send/2]).
+-export([get_stat/1]).
 
 %% direct api from eth
--export([send/2, set_active/2, set_filter/2]).
+-export([pid_get_stat/1,pid_set_active/2, pid_set_filter/2]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
@@ -48,12 +50,14 @@
 	  devices = [] :: [#device{}]
 	}).
 
--define(CMD_BIND,    1).
--define(CMD_UNBIND,  2).
--define(CMD_ACTIVE,  3).
--define(CMD_SETF,    4).
--define(CMD_DEBUG,   5).
--define(CMD_SUBF,    6).
+-define(CMD_BIND,             1).
+-define(CMD_UNBIND,           2).
+-define(CMD_PID_SET_ACTIVE,   3).
+-define(CMD_SET_FILTER,       4).
+-define(CMD_DEBUG,            5).
+-define(CMD_PID_SET_FILTER,   6).
+-define(CMD_PID_GET_STAT,     7).
+-define(CMD_GET_STAT,         8).
 
 -define(DLOG_DEBUG,     7).
 -define(DLOG_INFO,      6).
@@ -97,17 +101,33 @@ close(Interface) ->
 find(Interface) ->
     gen_server:call(?SERVER, {find, Interface}).
 
-%%
-%% Get the hardware of an interface
-%%
+%% @doc
+%%   Get the hardware of an interface
+%% @end
 get_address(Interface) ->
     gen_server:call(?SERVER, {get_address, Interface}). 
 
-%%
-%% Get interface list on form: [{Name,Addr,Port}]
-%%
+%% @doc
+%%   Get interface list on form: [{Name,Addr,Port}]
+%% @end
 get_list() ->
     gen_server:call(?SERVER, get_list).
+
+%% @doc
+%%   Get interface filter statitics 
+%% @end
+get_stat(Interface) when is_list(Interface) ->
+    case find(Interface) of
+	{ok,Port} ->
+	    get_stat(Port);
+	Error ->
+	    Error
+    end;
+get_stat(Port) when is_port(Port) ->
+    case port_call(Port, ?CMD_GET_STAT, []) of
+	{ok,A,B} -> {ok, [{recv,A},{drop,B}]};
+	Error -> Error
+    end.
 
 %%
 %% List ethernet device information
@@ -118,44 +138,54 @@ i() ->
 	      io:format("~10s ~s\n", [Name, eth_packet:ethtoa(Addr)])
       end, get_list()).
 
-%%
-%% Set filter for process Pid.
-%%
+%% @doc
+%%   Set filter for process Pid.
+%% @end
 set_filter(Interface, Pid, Filter) when
       (is_list(Interface) orelse is_port(Interface)),
       is_pid(Pid), is_binary(Filter) ->
     gen_server:call(?SERVER, {set_filter,Interface,Pid,Filter}).
 
-%% 
+%% @doc
 %% Set interface port debugging level
-%%
+%% @end
 debug(Interface, Level)  when is_atom(Level) ->
     gen_server:call(?SERVER, {set_debug,Interface,level(Level)}).
 
-%%
-%% Send frame data
-%%
+%% @doc
+%%  Send an ethernet frame 
+%% @end
+
 send(Port, Data) when is_port(Port), is_binary(Data) ->
     erlang:port_command(Port, Data).
 
-%%
+%% @doc
 %% Set direct active flag, this is per process (caller in this case)
-%% handle by eth_drv.
-%%
-set_active(Port, N) when is_port(Port), is_integer(N), N >= -1 ->
-    call(Port, ?CMD_ACTIVE, <<N:32/signed-integer>>).
-
+%%  handle by eth_drv.
+%% @end
+pid_set_active(Port, N) when is_port(Port), is_integer(N), N >= -1 ->
+    port_call(Port, ?CMD_PID_SET_ACTIVE, <<N:32/signed-integer>>).
+%% @doc
 %% Set direct filter for this process and initiate setting of
 %% the global filter.
-%%
-set_filter(Port, Filter) when is_port(Port), is_binary(Filter) ->
-    case call(Port, ?CMD_SUBF, Filter) of
+%% @end
+pid_set_filter(Port, Filter) when is_port(Port), is_binary(Filter) ->
+    case port_call(Port, ?CMD_PID_SET_FILTER, Filter) of
 	ok ->
 	    %% set the global filter (combine all filters)
 	    gen_server:call(?SERVER, {set_filter,Port,self(),Filter});
 	Error ->
 	    Error
     end.
+%% @doc
+%%  Get statistic about filter set for process (caller)
+%% @end
+pid_get_stat(Port) when is_port(Port) ->
+    case port_call(Port, ?CMD_PID_GET_STAT, []) of
+	{ok,A,B} -> {ok,[{total,A},{rejected,B}]};
+	Error -> Error
+    end.
+	    
 
 %%%===================================================================
 %%% gen_server callbacks
@@ -215,7 +245,7 @@ handle_call({open,Name}, _From, State) ->
 		    Driver = "eth_drv",
 		    try erlang:open_port({spawn_driver, Driver},[binary]) of
 			Port ->
-			    case call(Port, ?CMD_BIND, Name) of
+			    case port_call(Port, ?CMD_BIND, Name) of
 				ok ->
 				    D1 = D#device { port=Port },
 				    %% inform subscriber that interface is open?
@@ -238,7 +268,7 @@ handle_call({close,Name}, _From, State) ->
 	false ->
 	    {reply, {error,enoent}, State};
 	{value,D,Ds} ->
-	    case call(D#device.port, ?CMD_UNBIND, Name) of
+	    case port_call(D#device.port, ?CMD_UNBIND, Name) of
 		ok ->
 		    erlang:port_close(D#device.port),
 		    D1 = D#device { port=undefined },
@@ -258,7 +288,7 @@ handle_call({set_debug,Name,Level}, _From, State) ->
 	false ->
 	    {reply, {error, enoent}, State};
 	D when is_port(D#device.port) ->
-	    Reply = call(D#device.port, ?CMD_DEBUG, [Level]),
+	    Reply = port_call(D#device.port, ?CMD_DEBUG, [Level]),
 	    {reply, Reply, State};
 	_ ->
 	    {reply, {error, ebadfd}, State}
@@ -385,7 +415,7 @@ code_change(_OldVsn, State, _Extra) ->
 %%% Internal functions
 %%%===================================================================
 
-call(Port, Cmd, Data) ->
+port_call(Port, Cmd, Data) ->
     case erlang:port_control(Port, Cmd, Data) of
 	<<0>> ->
 	    ok;
@@ -396,6 +426,7 @@ call(Port, Cmd, Data) ->
 	<<1,Y>> -> {ok,Y};
 	<<2,Y:16/native-unsigned>> -> {ok, Y};
 	<<4,Y:32/native-unsigned>> -> {ok, Y};
+	<<8,A:32/native-unsigned,B:32/native-unsigned>> -> {ok,A,B};
 	<<3,Return/binary>> -> {ok,Return}
     end.
 
@@ -427,7 +458,7 @@ update_subscription(Device, Pid, Filter) ->
 
 update_filter(D) when is_port(D#device.port) ->
     Filter = combine_filter(D#device.subs),
-    call(D#device.port, ?CMD_SETF, Filter);
+    port_call(D#device.port, ?CMD_SET_FILTER, Filter);
 update_filter(undefined) ->
     {error,ebadfd}.
 

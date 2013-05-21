@@ -119,10 +119,10 @@ init([Interface]) ->
 %% @end
 %%--------------------------------------------------------------------
 handle_call({set_active,N}, _From, State) ->
-    Reply = eth_devices:set_active(State#state.eth, N),
+    Reply = eth:set_active(State#state.eth, N),
     {reply, Reply, State};
 handle_call({set_filter,Filter}, _From, State) ->
-    Reply = eth_devices:set_filter(State#state.eth, Filter),
+    Reply = eth:set_filter(State#state.eth, Filter),
     {reply, Reply, State};
 handle_call(counters, _From, State) ->
     {reply, {ok, {State#state.packet_counters, State#state.data_counters}}, 

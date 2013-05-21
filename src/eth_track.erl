@@ -70,9 +70,9 @@ init([Interface]) ->
 					   connect_filter(),
 					   disconnect_filter()}),
 	    Filter = eth_bpf:encode(Prog),
-	    case eth_devices:set_filter(Port, Filter) of
+	    case eth:set_filter(Port, Filter) of
 		ok ->
-		    eth_devices:set_active(Port, -1),
+		    eth:set_active(Port, -1),
 		    {ok, #state { eth = Port, con=T }};
 		Error ->
 		    {stop, Error}

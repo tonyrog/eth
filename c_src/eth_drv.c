@@ -51,6 +51,8 @@ typedef struct _eth_sub_t
     int32_t         active; // packet active mode/count
     uint32_t        plen;   // program len
     uint8_t*        prog;   // BPF program (driver_alloc)
+    uint32_t        prej;   // Number of packets rejected by prog
+    uint32_t        ptot;   // Total number of packets tested by prog
     struct _eth_sub_t* next;
 } eth_sub_t;
 
@@ -69,12 +71,15 @@ typedef struct _eth_ctx_t
     size_t         ibuflen;
 } eth_ctx_t;
 
-#define CMD_BIND   1
-#define CMD_UNBIND 2
-#define CMD_ACTIVE 3
-#define CMD_SETF   4
-#define CMD_DEBUG  5
-#define CMD_SUBF   6
+#define CMD_BIND              1
+#define CMD_UNBIND            2
+#define CMD_PID_SET_ACTIVE    3
+#define CMD_SET_FILTER        4
+#define CMD_DEBUG             5
+#define CMD_PID_SET_FILTER    6
+#define CMD_PID_GET_STAT      7
+#define CMD_GET_STAT          8
+
 
 static inline uint32_t get_uint32(uint8_t* ptr)
 {
@@ -484,8 +489,9 @@ static int bind_interface(eth_ctx_t* ctx)
 #elif defined(__APPLE__)
     struct ifreq ifr;
     int    len = strlen(ctx->if_name);
-    u_int promisc = 1;
-    u_int flush = 1;
+    u_int promisc  = 1;
+    u_int flush    = 1;
+    u_int hdrcmplt = 1;
 
     memset(&ifr, 0, sizeof(ifr));
     memcpy(ifr.ifr_name, ctx->if_name, len);
@@ -494,7 +500,11 @@ static int bind_interface(eth_ctx_t* ctx)
 	return -1;
     }
     if (ioctl(INT_EVENT(ctx->fd), BIOCPROMISC, &promisc) < 0) {
-	ERRORF("ioctl BIOCPROMISC error=%s", strerror(errno));
+	ERRORF("ioctl BIOCPROMISC=%d error=%s", promisc, strerror(errno));
+	return -1;
+    }
+    if (ioctl(INT_EVENT(ctx->fd), BIOCSHDRCMPLT, &hdrcmplt) < 0) {
+	ERRORF("ioctl BIOCSHDRCMPLT=%d error=%s", hdrcmplt, strerror(errno));
 	return -1;
     }
     if (ioctl(INT_EVENT(ctx->fd), BIOCFLUSH, &flush) < 0) {
@@ -528,6 +538,20 @@ static int unbind_interface(eth_ctx_t* ctx)
 #endif
 }
 
+static int get_bpf_stat(eth_ctx_t* ctx, uint32_t stat[2])
+{
+#if defined(__APPLE__)
+    struct bpf_stat bst;
+
+    if (ioctl(INT_EVENT(ctx->fd),  BIOCGSTATS, &bst) < 0)
+	return -1;
+    stat[0] = bst.bs_recv;
+    stat[1] = bst.bs_drop;
+    return 0;
+#else
+    return -1M
+#endif
+}
 //
 // Send an ARP_PACKET
 //
@@ -577,6 +601,7 @@ static int deliver_frame(eth_ctx_t* ctx, uint8_t* p, uint32_t len)
 
     ptr = ctx->first;
     while(ptr != NULL) {
+	ptr->ptot++;
 	if (ptr->active != 0) {
 	    if (eth_bpf_exec(ptr->prog, ptr->plen, p, len, 
 			     &bpf_err, &bpf_err_loc)) {
@@ -594,9 +619,12 @@ static int deliver_frame(eth_ctx_t* ctx, uint8_t* p, uint32_t len)
 		    }
 		}
 	    }
-	    else if (bpf_err != ETH_BPF_OK) {
-		DEBUGF("bpf_exec failed %s @%d", 
-		       eth_bpf_strerr(bpf_err), bpf_err_loc);
+	    else {
+		ptr->prej++;
+		if (bpf_err != ETH_BPF_OK) {
+		    DEBUGF("bpf_exec failed %s @%d", 
+			   eth_bpf_strerr(bpf_err), bpf_err_loc);
+		}
 	    }
 	}
 	ptr = ptr->next;
@@ -755,8 +783,8 @@ static ErlDrvSSizeT eth_drv_ctl(ErlDrvData d,
 	}
 	goto ok;
 	    
-	// Global filter
-    case CMD_SETF: {  // N*<<code:16,jt:8,jl:8,k:32>>
+	// Set interface filter
+    case CMD_SET_FILTER: {  // N*<<code:16,jt:8,jl:8,k:32>>
 	if ((len & 7) != 0) goto badarg;  // must be multiple of 8
 	if (set_bpf(ctx, buf, len) < 0)
 	    goto error;
@@ -764,7 +792,7 @@ static ErlDrvSSizeT eth_drv_ctl(ErlDrvData d,
     }
 
 	// Set local active
-    case CMD_ACTIVE: { // <<n:32/signed>>
+    case CMD_PID_SET_ACTIVE: { // <<n:32/signed>>
 	eth_sub_t** pptr;
 	eth_sub_t* ptr;
 	int32_t active;
@@ -802,7 +830,7 @@ static ErlDrvSSizeT eth_drv_ctl(ErlDrvData d,
     }
 
 	// Create or update subscription
-    case CMD_SUBF: {
+    case CMD_PID_SET_FILTER: {
 	eth_sub_t** pptr;
 	eth_sub_t* ptr;
 	uint8_t* prog;
@@ -830,6 +858,28 @@ static ErlDrvSSizeT eth_drv_ctl(ErlDrvData d,
 	ptr->prog = prog;
 	ptr->plen = plen;
 	goto ok;
+    }
+
+    case CMD_PID_GET_STAT: {
+	eth_sub_t** pptr;
+	eth_sub_t* ptr;
+	uint32_t stat[2];
+	if ((pptr = find_sub(ctx, driver_caller(ctx->port))) == NULL) {
+	    errno = ENOENT;
+	    goto error;
+	}
+	ptr = *pptr;
+	stat[0] = ptr->ptot;
+	stat[1] = ptr->prej;
+	return ctl_reply(sizeof(stat), (char*)stat, sizeof(stat), rbuf, rsize);
+	goto ok;
+    }
+
+    case CMD_GET_STAT: {
+	uint32_t stat[2];
+	if (get_bpf_stat(ctx, stat) < 0)
+	    goto error;
+	return ctl_reply(sizeof(stat), (char*)stat, sizeof(stat), rbuf, rsize);
     }
 
     case CMD_DEBUG: {
