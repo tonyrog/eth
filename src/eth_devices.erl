@@ -13,10 +13,11 @@
 %% API
 -export([start_link/0]).
 -export([open/1, close/1, find/1, debug/2]).
--export([set_filter/3]).
+-export([set_filter/3, get_address/1]).
+-export([get_list/0, i/0]).
 
 %% direct api from eth
--export([set_active/2, set_filter/2]).
+-export([send/2, set_active/2, set_filter/2]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
@@ -36,8 +37,9 @@
 
 -record(device,
 	{
-	  name = "" :: string(),
-	  subs = [] :: [#subscriber{}],
+	  name = ""    :: string(),
+	  hwaddr = ""  :: ethernet_address(),
+	  subs = []    :: [#subscriber{}],
 	  port :: undefined | port()
 	}).
 
@@ -77,28 +79,75 @@
 start_link() ->
     gen_server:start_link({local, ?SERVER}, ?MODULE, [], []).
 
+%%
+%% Try open an interface 
+%%
 open(Interface) ->
     gen_server:call(?SERVER, {open, Interface}).
 
+%%
+%% Close an open interface
+%%
 close(Interface) ->
     gen_server:call(?SERVER, {close, Interface}).
 
+%%
+%% Find port for an interface
+%%
 find(Interface) ->
     gen_server:call(?SERVER, {find, Interface}).
 
+%%
+%% Get the hardware of an interface
+%%
+get_address(Interface) ->
+    gen_server:call(?SERVER, {get_address, Interface}). 
+
+%%
+%% Get interface list on form: [{Name,Addr,Port}]
+%%
+get_list() ->
+    gen_server:call(?SERVER, get_list).
+
+%%
+%% List ethernet device information
+%%
+i() ->
+    lists:foreach(
+      fun({Name,Addr,_Port}) ->
+	      io:format("~10s ~s\n", [Name, eth_packet:ethtoa(Addr)])
+      end, get_list()).
+
+%%
+%% Set filter for process Pid.
+%%
 set_filter(Interface, Pid, Filter) when
       (is_list(Interface) orelse is_port(Interface)),
       is_pid(Pid), is_binary(Filter) ->
     gen_server:call(?SERVER, {set_filter,Interface,Pid,Filter}).
 
+%% 
+%% Set interface port debugging level
+%%
 debug(Interface, Level)  when is_atom(Level) ->
     gen_server:call(?SERVER, {set_debug,Interface,level(Level)}).
 
-%% direct port access
+%%
+%% Send frame data
+%%
+send(Port, Data) when is_port(Port), is_binary(Data) ->
+    erlang:port_command(Port, Data).
+
+%%
+%% Set direct active flag, this is per process (caller in this case)
+%% handle by eth_drv.
+%%
 set_active(Port, N) when is_port(Port), is_integer(N), N >= -1 ->
     call(Port, ?CMD_ACTIVE, <<N:32/signed-integer>>).
 
-%% direct set filter 
+%% Set direct filter for this process and initiate setting of
+%% the global filter.
+%%
 set_filter(Port, Filter) when is_port(Port), is_binary(Filter) ->
     case call(Port, ?CMD_SUBF, Filter) of
 	ok ->
@@ -124,9 +173,15 @@ set_filter(Port, Filter) when is_port(Port), is_binary(Filter) ->
 %% @end
 %%--------------------------------------------------------------------
 init([]) ->
-    Driver = "eth_drv", 
+    Driver = "eth_drv",
     ok = erl_ddll:load_driver(code:priv_dir(eth), Driver),
-    {ok, #state{}}.
+    {ok,IFs} = inet:getifaddrs(),
+    %% fixme: subscriber to netlink events, when interfaces are
+    %% added and removed!
+    Ds = [#device { name=Name,
+		    hwaddr=proplists:get_value(hwaddr,Fs,[])
+		  } || {Name,Fs} <- IFs ],
+    {ok, #state{ devices = Ds }}.
 
 %%--------------------------------------------------------------------
 %% @private
@@ -150,21 +205,33 @@ handle_call({find,Name}, _From, State) ->
 	    {reply, {ok, D#device.port}, State}
     end;
 handle_call({open,Name}, _From, State) ->
-    case lists:keyfind(Name, #device.name, State#state.devices) of
+    case lists:keytake(Name, #device.name, State#state.devices) of
 	false ->
-	    Driver = "eth_drv",
-	    Port = erlang:open_port({spawn_driver, Driver},[binary]),
-	    case call(Port, ?CMD_BIND, Name) of
-		ok ->
-		    D = #device { name=Name, port=Port },
-		    Ds = [D | State#state.devices],
-		    {reply, {ok,Port}, State#state { devices = Ds }};
-		Error ->
-		    erlang:port_close(Port),
-		    {reply, Error, State}
-	    end;
-	D ->
-	    {reply, {ok,D#device.port}, State}
+	    {reply, {error,enoent}, State};
+	{value,D,Ds} ->
+	    if is_port(D#device.port) ->
+		    {reply, {ok,D#device.port}, State};
+	       true ->
+		    Driver = "eth_drv",
+		    try erlang:open_port({spawn_driver, Driver},[binary]) of
+			Port ->
+			    case call(Port, ?CMD_BIND, Name) of
+				ok ->
+				    D1 = D#device { port=Port },
+				    %% inform subscriber that interface is open?
+				    %% re-set the filter ...
+				    Ds1 = [D1 | Ds],
+				    {reply, {ok,Port}, 
+				     State#state { devices=Ds1 }};
+				Error ->
+				    erlang:port_close(Port),
+				    {reply, Error, State}
+			    end
+		    catch
+			error:Reason ->
+			    {reply, {error,Reason}, State}
+		    end
+	    end
     end;
 handle_call({close,Name}, _From, State) ->
     case lists:keytake(Name, #device.name, State#state.devices) of
@@ -174,19 +241,27 @@ handle_call({close,Name}, _From, State) ->
 	    case call(D#device.port, ?CMD_UNBIND, Name) of
 		ok ->
 		    erlang:port_close(D#device.port),
-		    {reply, ok, State#state { devices = Ds }};
+		    D1 = D#device { port=undefined },
+		    %% inform subscriber that interface is closed?
+		    Ds1 = [D1 | Ds],
+		    {reply, ok, State#state { devices = Ds1 }};
 		Error ->
 		    erlang:port_close(D#device.port),
-		    {reply, Error, State#state { devices = Ds }}
+		    D1 = D#device { port=undefined },
+		    %% inform subscriber that interface is closed?
+		    Ds1 = [D1 | Ds],
+		    {reply, Error, State#state { devices = Ds1 }}
 	    end
     end;
 handle_call({set_debug,Name,Level}, _From, State) ->
     case lists:keyfind(Name, #device.name, State#state.devices) of
 	false ->
 	    {reply, {error, enoent}, State};
-	D ->
+	D when is_port(D#device.port) ->
 	    Reply = call(D#device.port, ?CMD_DEBUG, [Level]),
-	    {reply, Reply, State}
+	    {reply, Reply, State};
+	_ ->
+	    {reply, {error, ebadfd}, State}
     end;
 handle_call({set_filter,Port,Pid,Filter}, _From, State) when is_port(Port) ->
     case lists:keytake(Port, #device.port, State#state.devices) of
@@ -206,6 +281,18 @@ handle_call({set_filter,Name,Pid,Filter}, _From, State) when is_list(Name) ->
 	    Result = update_filter(D1),
 	    {reply, Result, State#state { devices = [D1|Ds] }}
     end;
+handle_call({get_address,Name}, _From, State) ->
+    case lists:keyfind(Name, #device.name, State#state.devices) of
+	false -> 
+	    {reply, {error, enoent}, State};
+	D -> 
+	    {reply, {ok,D#device.hwaddr}, State}
+    end;
+handle_call(get_list, _From, State) ->
+    {reply, [{Name,Addr,Port} || 
+		#device { name=Name, hwaddr=Addr, port=Port} <- 
+		    State#state.devices], State};
+
 handle_call(_Request, _From, State) ->
     {reply, {error, bad_call}, State}.
 
@@ -338,14 +425,15 @@ update_subscription(Device, Pid, Filter) ->
     end.
 
 
-update_filter(Device) ->
-    Filter = combine_filter(Device#device.subs),
-    call(Device#device.port, ?CMD_SETF, Filter).
+update_filter(D) when is_port(D#device.port) ->
+    Filter = combine_filter(D#device.subs),
+    call(D#device.port, ?CMD_SETF, Filter);
+update_filter(undefined) ->
+    {error,ebadfd}.
 
 combine_filter(Subs) ->
     Fs = [S#subscriber.filter || S <- Subs, S#subscriber.active],
     eth_bpf:join(Fs).
-
 
 %% convert symbolic to numeric level
 level(debug) -> ?DLOG_DEBUG;

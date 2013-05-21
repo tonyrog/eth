@@ -123,6 +123,9 @@ static int  eth_drv_init(void);
 static void eth_drv_finish(void);
 static void eth_drv_stop(ErlDrvData);
 static void eth_drv_output(ErlDrvData, char*, ErlDrvSizeT);
+#if 0
+static void eth_drv_outputv(ErlDrvData d, ErlIOVec *ev);
+#endif
 static void eth_drv_ready_input(ErlDrvData, ErlDrvEvent);
 static void eth_drv_ready_output(ErlDrvData data, ErlDrvEvent event);
 static ErlDrvData eth_drv_start(ErlDrvPort, char* command);
@@ -348,7 +351,7 @@ static int get_ifindex(int fd, const uint8_t* ifname, size_t len)
     memcpy(ifr.ifr_name, ifname, len);
     
     if (ioctl(fd, SIOCGIFINDEX, &ifr) < 0) {
-	ERRORF("iocrl error=%s", strerror(errno));
+	ERRORF("ioctl error=%s", strerror(errno));
 	return -1;
     }
     index = ifr.ifr_ifindex;
@@ -856,13 +859,16 @@ bpf_error: {
 
 static void eth_drv_output(ErlDrvData d, char* buf, ErlDrvSizeT len)
 {
-    (void) d;
-    (void) buf;
-    (void) len;
-    // eth_ctx_t*   ctx = (eth_ctx_t*) d;
+    eth_ctx_t*   ctx = (eth_ctx_t*) d;
+    int n;
     DEBUGF("eth_drv: output");
+    n = write(INT_EVENT(ctx->fd), buf, len);
+    if (n != len) {
+	ERRORF("write error=%s", strerror(errno));
+    }
 }
 
+#if 0
 static void eth_drv_outputv(ErlDrvData d, ErlIOVec *ev)
 {
     (void) d;
@@ -870,6 +876,7 @@ static void eth_drv_outputv(ErlDrvData d, ErlIOVec *ev)
 //  eth_ctx_t*   ctx = (eth_ctx_t*) d;
     DEBUGF("eth_drv: outputv");
 }
+#endif
 
 static void eth_drv_event(ErlDrvData d, ErlDrvEvent e,
 				  ErlDrvEventData ed)
@@ -954,7 +961,7 @@ DRIVER_INIT(eth_drv)
     ptr->finish = eth_drv_finish;
     ptr->control = eth_drv_ctl;
     ptr->timeout = eth_drv_timeout;
-    ptr->outputv = eth_drv_outputv;
+    ptr->outputv = NULL; // eth_drv_outputv;
     ptr->ready_async = 0;
     ptr->flush = 0;
     ptr->call = 0;

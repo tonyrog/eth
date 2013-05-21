@@ -8,7 +8,20 @@
 %%%-------------------------------------------------------------------
 -module(eth).
 
--export([set_active/2, set_filter/2]).
+-export([send/2, set_active/2, set_filter/2]).
+
+%% @doc
+%%  Send frame.
+%% @end
+send(Interface, Data) when is_list(Interface), is_binary(Data) ->
+    case eth_devices:find(Interface) of
+	{ok,Port} ->
+	    eth_devices:send(Port, Data);
+	Error ->
+	    Error
+    end;
+send(Port, Data) when is_port(Port), is_binary(Data) ->
+    eth_devices:send(Port, Data).
 
 %% @doc
 %%  Set packet active mode.

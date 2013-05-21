@@ -13,6 +13,7 @@
 -export([fmt_json/1, fmt_yang/1]).
 -export([dump/1, dump_json/1, dump_yang/1]).
 -export([parse_json/1, parse_yang/1]).
+-export([ethtoa/1]).
 
 -define(Q, $").
 
@@ -275,6 +276,9 @@ separator(D,S) ->
 indent(I) ->
     lists:duplicate(I, $\s).
 
-ethtoa({A,B,C,D,E,F}) ->
-    string:join([tl(erlang:integer_to_list(X+16#100,16)) || 
-		    X <- [A,B,C,D,E,F]], ":").
+ethtoa([]) -> "";
+ethtoa(L=[_A,_B,_C,_D,_E,_F]) ->
+    string:join([tl(erlang:integer_to_list(X+16#100,16)) || X <- L], ":");
+ethtoa({A,B,C,D,E,F}) -> ethtoa([A,B,C,D,E,F]);
+ethtoa(_) -> "?".
+

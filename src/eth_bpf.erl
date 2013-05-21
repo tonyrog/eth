@@ -264,11 +264,11 @@ class(I) ->
 	jgtk  -> {jmp,'>', k};
 	jgek  -> {jmp,'>=',k};
 	jeqk  -> {jmp,'==',k};
-	jsetk -> {jmp,'&=',k};
+	jsetk -> {jmp,'&',k};
 	jgtx  -> {jmp,'>', x};
 	jgex  -> {jmp,'>=',x};
 	jeqx  -> {jmp,'==',x};
-	jsetx -> {jmp,'&=',x};
+	jsetx -> {jmp,'&',x};
 
 	addk -> {alu,a,{k,K}};
 	subk -> {alu,a,{k,K}};
@@ -410,7 +410,7 @@ print_jmp_c(true,k,I,L,J) ->
 		      [L,J+1+I#bpf_insn.k])
     end;
 print_jmp_c(Cond,k,I,L,J) ->
-    io:format("~sif (A ~s 16#~.16B) goto L~.3.0w; else goto L~.3.0w;\n", 
+    io:format("~sif (A ~s #0x~.16B) goto L~.3.0w; else goto L~.3.0w;\n", 
 	      [L,Cond,I#bpf_insn.k,
 	       J+1+I#bpf_insn.jt,J+1+I#bpf_insn.jf]);
 print_jmp_c(Cond,x,I,L,J) ->
@@ -545,11 +545,12 @@ optimise_bl_(Bs, I) when I>?MAX_OPTIMISE ->
     print_bs(Bs);
 optimise_bl_(Bs, I) ->
     io:format("OPTIMISE: ~w\n", [I]),
-    L = [fun remove_ld_bs/1,
-	 fun remove_st_bs/1,
-	 fun remove_multiple_jmp_bs/1,
+    L = [fun remove_ld/1,
+	 fun remove_st/1,
+	 fun remove_multiple_jmp/1,
 	 fun remove_unreach/1,
 	 fun constant_propagation/1,
+	 fun bitfield_jmp/1,
 	 fun remove_unreach/1],
     Bs1 = optimise_list_(L, Bs#bpf_bs { changed = 0 }),
     if Bs1#bpf_bs.changed =:= 0 ->
@@ -565,7 +566,7 @@ optimise_list_([], Bs) ->
     Bs.
 
 %% remove duplicate/unnecessary ld M[K] instructions or a sta
-remove_ld_bs(Bs) when is_record(Bs,bpf_bs) ->
+remove_ld(Bs) when is_record(Bs,bpf_bs) ->
     bs_map_block(
       fun(B) ->B#bpf_block { insns=remove_ld_bl_(B#bpf_block.insns)} end,
       Bs).
@@ -653,7 +654,7 @@ remove_ld_bl_([]) ->
 %%    X=A        tax, if X is never reference (before killed)
 %%    X=<const>  ldx, if X is never reference (before killed)
 %%
-remove_st_bs(Bs) when is_record(Bs,bpf_bs) ->
+remove_st(Bs) when is_record(Bs,bpf_bs) ->
     bs_map_block(fun(B) -> remove_st_bl_(B, Bs) end, Bs).
 
 remove_st_bl_(B, Bs) ->
@@ -705,7 +706,13 @@ is_referenced_mk(K, Is, B, Bs) ->
       end, false, Is, B, Bs).
 
 %% check if A is referenced (or killed)
+is_referenced_aj(As, Bs) ->
+    is_referenced_a([], As, undefined, Bs).
+
 is_referenced_a(Is,B,Bs) ->
+    is_referenced_a(Is, [], B, Bs).
+    
+is_referenced_a(Is,As,B,Bs) ->
     loop_insns(
       fun(J,_Acc) ->
 	      case class(J) of
@@ -730,7 +737,7 @@ is_referenced_a(Is,B,Bs) ->
 		      %% move on
 		      {next,false}
 	      end
-      end, false, Is, B, Bs).
+      end, false, Is, As, B, Bs).
 
 %% check if X is referenced (or killed)
 is_referenced_x(Is,B,Bs) ->
@@ -767,6 +774,12 @@ is_referenced_x(Is,B,Bs) ->
 loop_insns(Fun, Acc, Is, B, Bs) ->
     loop_insns_(Fun, Acc, Is++[B#bpf_block.next],[],B,Bs,sets:new()).
 
+loop_insns(Fun, Acc, Is, As, undefined, Bs) ->
+    loop_insns_(Fun, Acc, Is,As,undefined,Bs,sets:new());
+loop_insns(Fun, Acc, Is, As, B, Bs) ->
+    loop_insns_(Fun, Acc, Is++[B#bpf_block.next],As,B,Bs,sets:new()).
+    
+
 loop_insns_(Fun,Acc,[I|Is],As,B,Bs,Vs) ->
     case Fun(I, Acc) of
 	{ok, Acc1} -> 
@@ -798,9 +811,68 @@ loop_insns_(Fun,Acc,[],As,B,Bs,Vs) ->
     end.
 
 %%
+%% Find bitfield & optimise jumps:
+%% A)
+%%    A >>= 0x1;
+%%    A &= 0x1;
+%%    if (A > 0x0) goto L1; else goto L2;
+%% ==>
+%%    if (A & 0x02) goto L1; else goto L2;  (if A is not referenced in L1/L2)
+%% B)
+%%    A &= 0x10;
+%%    if (A > 0x0) goto L1; else goto L2;
+%% ==>    
+%%    if (A > 0x10) goto L1; else goto L2;
+%%
+bitfield_jmp(Bs) when is_record(Bs,bpf_bs) ->
+    bs_fold_block(fun(B,Bsi) -> bitfield_jmp_bl_(B, Bsi) end, Bs, Bs).
+
+bitfield_jmp_bl_(B, Bs) ->
+    case reverse(B#bpf_block.insns) of
+	[#bpf_insn{ code=andk, k=1 }, #bpf_insn{ code=rshk, k=K } | Is] ->
+	    case B#bpf_block.next of
+		N = #bpf_insn { code=jgtk, k=0 } ->
+		    io:format("BITFIELD 1\n"),
+		    case is_referenced_aj([N#bpf_insn.jt,N#bpf_insn.jf],Bs) of
+			true ->
+			    io:format(" REFERENCED\n"),
+			    Bs;
+			false ->
+			    io:format(" UPDATED\n"),
+			    N1 = N#bpf_insn { code=jsetk, k=(1 bsl K) },
+			    B1 = B#bpf_block { insns=reverse(Is),
+					       next = N1},
+			    bs_set_block(B1, Bs)
+		    end;
+		_ ->
+		    Bs
+	    end;
+	[#bpf_insn{ code=andk, k=Km } | Is] ->
+	    case B#bpf_block.next of
+		N = #bpf_insn { code=jgtk, k=0 } ->
+		    io:format("BITFIELD 1\n"),
+		    case is_referenced_aj([N#bpf_insn.jt,N#bpf_insn.jf],Bs) of
+			true ->
+			    io:format(" REFERENCED\n"),
+			    Bs;
+			false ->
+			    io:format(" UPDATED\n"),
+			    N1 = N#bpf_insn { code=jsetk, k=Km },
+			    B1 = B#bpf_block { insns=reverse(Is),
+					       next = N1},
+			    bs_set_block(B1, Bs)
+		    end;
+		_ ->
+		    Bs
+	    end;
+	_ ->
+	    Bs
+    end.
+
+%%
 %% remove multiple unconditional jumps 
 %%
-remove_multiple_jmp_bs(Bs) when is_record(Bs,bpf_bs) ->
+remove_multiple_jmp(Bs) when is_record(Bs,bpf_bs) ->
     bs_fold_block(fun(B,BsI) -> remove_multiple_jmp_bl_(B, BsI) end, Bs, Bs).
 
 %% 1 - fanout is unconditional jump 
@@ -823,11 +895,25 @@ remove_multiple_jmp_bl_(B, Bs) ->
 	    Bt = bs_get_block(Jt, Bs),
 	    Jt2 = case {Bt#bpf_block.insns, get_fanout(Bt#bpf_block.next)} of
 		      {[], [Jt1]} -> Jt1;
+		      {[],[Jt1,_Jf1]} ->
+			  %% Same condition on the landing site?
+			  case {B#bpf_block.next,Bt#bpf_block.next} of
+			      {#bpf_insn { code=jgtk, k=0},
+			       #bpf_insn { code=jgtk, k=0}} -> Jt1;
+			      _ -> Jt
+			  end;
 		      _ -> Jt
 		  end,
 	    Bf = bs_get_block(Jf, Bs),
 	    Jf2 = case {Bf#bpf_block.insns, get_fanout(Bf#bpf_block.next)} of
 		      {[], [Jf1]} -> Jf1;
+		      {[],[_Jt1,Jf1]} ->
+			  %% Same condition on the landing site?
+			  case {B#bpf_block.next,Bf#bpf_block.next} of
+			      {#bpf_insn { code=jgtk, k=0},
+			       #bpf_insn { code=jgtk, k=0}} -> Jf1;
+			      _ -> Jf
+			  end;
 		      _ -> Jf
 		  end,
 	    if Jt =/= Jt2; Jf =/= Jf2 ->
@@ -846,8 +932,7 @@ remove_multiple_jmp_bl_(B, Bs) ->
 %% Remove unreachable blocks
 %%
 remove_unreach(Bs) when is_record(Bs,bpf_bs) ->
-    %% FIXME: Bs#bpf_bs.init instead of 1
-    remove_unreach_([1], Bs, sets:new()).
+    remove_unreach_([Bs#bpf_bs.init], Bs, sets:new()).
 
 remove_unreach_([I|Is], Bs, Vs) ->
     case sets:is_element(I, Vs) of
@@ -1063,8 +1148,30 @@ eval_op_(I, Is, Js, D, Op, R, A, Op1, Op2) ->
 	    case get_reg(A, D1) of
 		K0 when is_integer(K0) ->
 		    I1 = I#bpf_insn { code=Op2, k=K0},
-		    io:format("CHANGE: ~w TO ~w\n", [I, I1]),
-		    constant_ev_(Is, [I1|Js], D1);
+		    %% Try remove noops, more?
+		    case Op2 of
+			subk when K0 =:= 0 ->
+			    io:format("REMOVE: ~w\n", [I1]),
+			    constant_ev_(Is, Js, D1);
+			addk when K0 =:= 0 ->
+			    io:format("REMOVE: ~w\n", [I1]),
+			    constant_ev_(Is, Js, D1);
+			mulk when K0 =:= 1 ->
+			    io:format("REMOVE: ~w\n", [I1]),
+			    constant_ev_(Is, Js, D1);
+			divk when K0 =:= 1 ->
+			    io:format("REMOVE: ~w\n", [I1]),
+			    constant_ev_(Is, Js, D1);
+			lshk when K0 =:= 0 ->
+			    io:format("REMOVE: ~w\n", [I1]),
+			    constant_ev_(Is, Js, D1);
+			rshk when K0 =:= 0 ->
+			    io:format("REMOVE: ~w\n", [I1]),
+			    constant_ev_(Is, Js, D1);
+			_ ->
+			    io:format("CHANGE: ~w TO ~w\n", [I, I1]),
+			    constant_ev_(Is, [I1|Js], D1)
+		    end;
 		_ ->
 		    constant_ev_(Is, [I|Js], D1)
 	    end
@@ -1191,7 +1298,7 @@ intersect_value(X,Y) ->
 %%
 prog_to_bs(Prog) when is_tuple(Prog) ->
     Map = build_target_map_(Prog),
-    prog_to_bs_(Prog, 1, Map, 1, [], bs_new()).
+    prog_to_bs_(Prog, 1, Map, 1, [], bs_new(1)).
 
 prog_to_bs_(Prog, J, Map, A, Acc, Bs) when J =< tuple_size(Prog) ->
     I = element(J, Prog),
@@ -1286,9 +1393,12 @@ prog_map_([], _J, _Map) ->
 
 %%
 %% Topological sort the basic block DAG.
+%% return a list of topsorted blocks
 %%
-topsort(Bs) ->
-    topsort_([1], Bs, [], sets:new()).
+-spec topsort(Bs::#bpf_bs{}) -> [#bpf_block{}].
+
+topsort(Bs) when is_record(Bs,bpf_bs) ->
+    topsort_([Bs#bpf_bs.init], Bs, [], sets:new()).
 
 topsort_([{add,N,Bn}|Q], Bs, L, Vs) ->
     topsort_(Q, Bs, [Bn|L], sets:add_element(N,Vs));
@@ -2078,8 +2188,9 @@ code_length(Code) ->
 %%  }
 %%
 
-bs_new() ->
+bs_new(Init) ->
     #bpf_bs {
+       init = Init,
        changed = 0,
        block  = dict:new(),
        fanin  = dict:new(),

@@ -103,8 +103,9 @@
 
 -record(bpf_bs,
 	{
+	  init :: term(),             %% label of start block
 	  changed = 0 :: integer(),
-	  block :: dict(),
+	  block  :: dict(),
 	  fanin  :: dict(),
 	  fanout :: dict()
 	}).
