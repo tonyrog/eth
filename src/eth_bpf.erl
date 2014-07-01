@@ -21,25 +21,337 @@
 -export([accept/0, 
 	 reject/0,
 	 return/1, 
-	 expr/1]).
-%% some predefined expressions
--export([is_arp/0, is_revarp/0, is_ipv4/0, is_ipv6/0, is_ip/0,
-	 is_ipv4_proto/1, is_ipv6_proto/1, 
-	 is_icmp/0,
-	 is_tcp/0, is_udp/0,
-	 is_ipv4_tcp_src/1, is_ipv4_tcp_dst/1,
-	 is_ipv4_tcp_dst_port/1, is_ipv4_tcp_src_port/1,
-	 is_ipv6_tcp_dst_port/1, is_ipv6_tcp_src_port/1,
-	 is_tcp_dst_port/1, is_tcp_src_port/1,
-	 is_tcp_syn/0, is_tcp_ack/0, is_tcp_fin/0, is_tcp_psh/0]).
+	 expr/1,
+	 expr/2]).
 
+%% some predefined expressions
 -compile(export_all).
 
 -import(lists, [reverse/1, foldl/3]).
 
--define(MAX_OPTIMISE, 10).
+%% -define(DEBUG, true).
+
+-ifdef(DEBUG).
+-define(debug(F,A),
+	 io:format("~s:~w: debug: "++(F), [?FILE,?LINE|(A)])).
+-else.
+-define(debug(F,A), ok).
+-endif.
+
+-define(warning(F,A), 
+	io:format("~s:~w: warning: "++(F), [?FILE,?LINE|(A)])).
+-define(error(F,A),
+	io:format("~s:~w: error: "++(F), [?FILE,?LINE|(A)])).
+-define(info(F,A),
+	io:format("~s:~w: info: "++(F), [?FILE,?LINE|(A)])).
+
+
+%% Some optimisations propagate slowly so we must handle this max better!
+-define(MAX_OPTIMISE, 100).
 
 -define(uint32(X), ((X) band 16#ffffffff)).
+
+-define(U8,  1).
+-define(U16, 2).
+-define(U32, 4).
+%%
+%% Examples (remove soon)
+%%
+-define(ETHERTYPE_PUP,    16#0200).
+-define(ETHERTYPE_IP,     16#0800).
+-define(ETHERTYPE_ARP,    16#0806).
+-define(ETHERTYPE_REVARP, 16#8035).
+-define(ETHERTYPE_VLAN,   16#8100).
+-define(ETHERTYPE_IPV6,   16#86dd).
+
+
+-define(ARPOP_REQUEST,  1).	%% ARP request.
+-define(ARPOP_REPLY,    2).	%% ARP reply.
+-define(ARPOP_RREQUEST, 3).	%% RARP request.
+-define(ARPOP_RREPLY,   4).     %% RARP reply.
+
+-define(IPPROTO_ICMP, 1).
+-define(IPPROTO_TCP,  6).
+-define(IPPROTO_UDP,  17).
+-define(IPPROTO_SCTP, 132).
+
+-define(OFFS_ETH,        (0)).
+-define(OFFS_ETH_DST,    (0)).
+-define(OFFS_ETH_SRC,    (6)).
+-define(OFFS_ETH_TYPE,   (6+6)).
+-define(OFFS_ETH_DATA,   (6+6+2)).
+
+-define(VLAN, 4).
+
+-define(OFFS_VLAN_TPID,  (?OFFS_ETH_DATA)).
+-define(OFFS_VLAN_TCI,  (?OFFS_ETH_DATA+2)).
+
+-define(OFFS_ARP_HTYPE,  (?OFFS_ETH_DATA)).
+-define(OFFS_ARP_PTYPE,  (?OFFS_ETH_DATA+2)).
+-define(OFFS_ARP_HALEN,  (?OFFS_ETH_DATA+4)).
+-define(OFFS_ARP_PALEN,  (?OFFS_ETH_DATA+5)).
+-define(OFFS_ARP_OP,     (?OFFS_ETH_DATA+6)).
+
+-define(OFFS_IPV4,       (?OFFS_ETH_DATA+0)).
+-define(OFFS_IPV4_HLEN,  (?OFFS_ETH_DATA+0)).
+-define(OFFS_IPV4_DSRV,  (?OFFS_ETH_DATA+1)).
+-define(OFFS_IPV4_LEN,   (?OFFS_ETH_DATA+2)).
+-define(OFFS_IPV4_ID,    (?OFFS_ETH_DATA+4)).
+-define(OFFS_IPV4_FRAG,  (?OFFS_ETH_DATA+6)).
+-define(OFFS_IPV4_TTL,   (?OFFS_ETH_DATA+8)).
+-define(OFFS_IPV4_PROTO, (?OFFS_ETH_DATA+9)).
+-define(OFFS_IPV4_CSUM,  (?OFFS_ETH_DATA+10)).
+-define(OFFS_IPV4_SRC,   (?OFFS_ETH_DATA+12)).
+-define(OFFS_IPV4_DST,   (?OFFS_ETH_DATA+16)).
+-define(OFFS_IPV4_DATA,  (?OFFS_ETH_DATA+20)).
+
+-define(OFFS_IPV6,      (?OFFS_ETH_DATA+0)).
+-define(OFFS_IPV6_LEN,  (?OFFS_ETH_DATA+4)).
+-define(OFFS_IPV6_NEXT, (?OFFS_ETH_DATA+6)).
+-define(OFFS_IPV6_HOPC, (?OFFS_ETH_DATA+7)).
+-define(OFFS_IPV6_SRC,  (?OFFS_ETH_DATA+8)).
+-define(OFFS_IPV6_DST,  (?OFFS_ETH_DATA+24)).
+-define(OFFS_IPV6_PAYLOAD, (?OFFS_ETH_DATA+40)).
+
+%% Given that X contains the IP headers length
+-define(OFFS_TCP_SRC_PORT, 0).  %% uint16
+-define(OFFS_TCP_DST_PORT, 2).  %% uint16
+-define(OFFS_TCP_SEQ,      4).  %% uint32
+-define(OFFS_TCP_ACK,      8).  %% uint32
+-define(OFFS_TCP_FLAGS,    12). %% Offs:4,_:6,UAPRSF:6
+-define(OFFS_TCP_WINDOW,   14). %% uint16
+-define(OFFS_TCP_CSUM,     16). %% uint16
+-define(OFFS_TCP_UPTR,     18). %% uint16
+
+-define(OFFS_UDP_SRC_PORT,  0).  %% uint16
+-define(OFFS_UDP_DST_PORT,  2).  %% uint16
+-define(OFFS_UDP_LENGTH,    4).  %% uint16
+-define(OFFS_UDP_CSUM,      6).  %% uint16
+-define(OFFS_UDP_DATA,      8).  
+
+
+test1() ->
+    build_programx({'&&', ["eth.type.ip", "ip.proto.tcp",
+			   {'==',"ip.frag",0},
+			   "ip.tcp.flag.syn",
+			   "ip.tcp.flag.ack"]}).
+
+test2() ->
+    build_programx({'||', 
+		    {'&&', ["eth.type.ip", "ip.proto.tcp",
+			    {'==',"ip.frag",0},
+			    "ip.tcp.flag.syn",
+			    "ip.tcp.flag.ack"]},
+		    {'&&', ["eth.type.ip", "ip.proto.tcp",
+			    {'==',"ip.frag",0},
+			    "ip.tcp.flag.fin",
+			    "ip.tcp.flag.ack"]}}).
+
+test3() ->
+    build_program_list(
+      [{'&&', ["eth.type.ip",
+	       {'==', "ip.src[0]", 192},
+	       {'==', "ip.src[1]", 14}
+	      ]},
+       
+       {'&&', ["eth.type.ip",
+	       {'==', "ip.src[0]", 192},
+	       {'==', "ip.src[1]", 15}
+	      ]},
+
+       {'&&', ["eth.type.ip",
+	       {'==', "ip.src[0]", 192},
+	       {'==', "ip.src[1]", 16}
+	      ]},
+
+       {'&&', ["eth.type.ip",
+	       {'==', "ip.src[0]", 239},
+	       {'==', "ip.src[1]", 17}
+	      ]},
+
+       {'&&', ["eth.type.ip",
+	       {'==', "ip.src[0]", 235}
+	      ]},
+
+       {'&&', ["eth.type.ip", "ip.src.10.13.75.100"]},
+       {'&&', ["eth.type.ip", "ip.src.10.13.75.101"]},
+       {'&&', ["eth.type.ip", "ip.src.10.13.75.102"]},
+       {'&&', ["eth.type.ip6",
+	       "ip6.src.fd6b:9860:79f5:ae8c:600b:8ea1:fbf9:807"]},
+       {'&&', ["eth.type.ip6",
+	       "ip6.src.fd6b:9860:79f5:ae8c:600b:8ea1:fbf9:808"]}
+      ]).
+
+
+test4() ->
+    build_programx(
+      {'&&',["eth.type.ip",
+	     "ip.proto.udp",
+	     {'||',
+	      ["ip.src.1.2.3.4",
+	       "ip.src.1.2.3.12",
+	       "ip.src.1.2.3.14",
+	       "ip.src.1.2.3.23",
+	       "ip.src.1.2.3.100",
+	       "ip.src.1.2.3.103",
+	       "ip.src.1.2.3.111",
+	       "ip.src.1.2.3.115",
+	       "ip.src.1.2.3.117",
+	       "ip.src.1.2.3.119"
+	      ]}]}).
+
+test41() ->
+    build_programx(
+      {'||',
+       [{'&&',["eth.type.ip","ip.proto.udp",   "ip.src.1.2.3.4"]},
+	{'&&',["eth.type.ip","ip.proto.udp",   "ip.src.1.2.3.12"]},
+	{'&&',["eth.type.ip","ip.proto.udp",   "ip.src.1.2.3.14"]},
+	{'&&',["eth.type.ip","ip.proto.udp",   "ip.src.1.2.3.23"]},
+	{'&&',["eth.type.ip","ip.proto.udp",   "ip.src.1.2.3.100"]},
+	{'&&',["eth.type.ip","ip.proto.udp",   "ip.src.1.2.3.103"]},
+	{'&&',["eth.type.ip","ip.proto.udp",   "ip.src.1.2.3.111"]},
+	{'&&',["eth.type.ip","ip.proto.udp",   "ip.src.1.2.3.115"]},
+	{'&&',["eth.type.ip","ip.proto.udp",   "ip.src.1.2.3.117"]},
+	{'&&',["eth.type.ip","ip.proto.udp",   "ip.src.1.2.3.119"]}
+       ]}).
+
+test51() ->
+    build_programx(
+      {'&&',
+       ["eth.type.ip",
+	"ip.src.192.168.1.16..192.168.1.32"
+	%% "ip.src.192.168.2.0/24"
+       ]}).
+
+test52() ->
+    build_programx(	 
+      {'&&', 
+       ["eth.type.ip6",
+	"ip6.src.0:1:0:2:0:3:192.168.1.16..0:1:0:2:0:3:192.168.1.32"
+	%% "ip6.src.1::5:6:192.168.2.0/120"
+       ]}).
+
+%% should be same as port.53!
+test53() ->
+    build_programx(
+      {'||',
+       [{'&&',["eth.type.ip",
+	       "ip.proto.tcp",
+	       "ip.tcp.src_port.53",
+	       "ip.tcp.dst_port.53"]},
+	{'&&',["eth.type.ip",
+	       "ip.proto.udp",
+	       "ip.udp.src_port.53",
+	       "ip.udp.dst_port.53"]},
+	{'&&',["eth.type.ip6",
+	       "ip6.proto.tcp",
+	       "ip6.tcp.src_port.53",
+	     "ip6.tcp.dst_port.53"]},
+	{'&&',["eth.type.ip6",
+	       "ip6.proto.udp",
+	       "ip6.udp.src_port.53",
+	       "ip6.udp.dst_port.53"]}]}).
+
+test6() ->
+    build_programx(
+      {'&&', ["eth.type.ip",
+	      "ip.host.192.168.1.103"]}).
+
+test_http_get() ->
+    eth_bpf:build_programx(
+      {'&&',
+       ["eth.type.ip","ip.proto.tcp", {'==',"ip.frag",0},
+	"ip.tcp.flag.psh",
+	{memeq, "ip.tcp.data", <<"GET ">>}
+       ]}).
+
+test_teclo_profile() ->
+    build_program_list(
+      [  {'&&', ["vlan", "eth.type.ip", "ip.src.41.0.0.228" ]},
+	 {'&&', ["vlan",
+		 "eth.type.ip",
+		 {'||', ["ip.src.41.185.26.72",
+			 "ip.src.117.121.243.78",
+			 "ip.src.159.253.209.38",
+			 "ip.src.188.40.129.212",
+
+			 "ip.dst.41.185.26.72",
+			 "ip.dst.117.121.243.78",
+			 "ip.dst.159.253.209.38",
+			 "ip.dst.188.40.129.212"
+
+			]}]},
+	 {'&&', ["vlan",
+		 "eth.type.ip",
+		 {'||', ["ip.src.10.188.0.0/18",
+			 "ip.src.10.194.0.0/18",
+
+			 "ip.dst.10.188.0.0/18",
+			 "ip.dst.10.194.0.0/18"
+
+			]}]},
+	 {'||', [ {'&&', ["eth.type.ip", "ip.proto.tcp"]},
+		  {'&&', ["vlan",
+			  "eth.type.ip", "ip.proto.tcp"]}
+		]}
+      ]).
+
+test_contrack() ->
+    eth_bpf:build_programx(
+      {'||', 
+       [connect_filter(),
+	disconnect_filter(),
+	reset_filter()
+       ]}).
+
+%% TCP - SYN/ACK => established
+connect_filter() ->
+    {'&&', ["eth.type.ip", "ip.proto.tcp",
+	    {'==',"ip.frag",0},
+	    "ip.tcp.flag.syn", "ip.tcp.flag.ack"
+	   ]}.
+
+%% TCP - FIN/ACK => disconnected
+disconnect_filter() ->
+    {'&&', ["eth.type.ip", "ip.proto.tcp",
+	    {'==',"ip.frag",0},
+	    "ip.tcp.flag.fin","ip.tcp.flag.ack"
+	   ]}.
+
+reset_filter() ->
+    {'&&', ["eth.type.ip", "ip.proto.tcp",
+	    {'==',"ip.frag",0},
+	    "ip.tcp.flag.rst"
+	   ]}.
+
+
+test_teclo_optimise() ->
+    build_program_list(
+      [ 
+	%% "vlan and host "41.0.0.228"
+	{'&&', ["vlan",
+		"eth.type.ip",
+		"ip.host.41.0.0.228"]},
+
+	%% "vlan (?tcp) and ((dst port 45373) or (src portrange 50000-59999))",
+	{'&&', ["vlan",
+		"eth.type.ip",
+		"ip.proto.tcp",
+		{'||',
+		 "ip.tcp.dst_port.45373",
+		 "ip.tcp.src_port.50000..59999"}
+	       ]},
+	%%  (ip[12]+ip[13]+ip[14]+ip[15]) & 1 == ((src rem 255) & 1) ???
+	%% "(vlan and ((ip[12]+ip[13]+ip[14]+ip[15]) & 1) == 1) ",
+	{'&&', ["vlan",
+		"eth.type.ip",
+		{'==', 
+		 {'&', 
+		  {'+', [ "ip[12]", "ip[13]", "ip[14]", "ip[15]" ] }, 1}, 1}
+	       ]},
+	%% "tcp"
+	{'&&', ["eth.type.ip", "ip.proto.tcp"]}
+      ]).
 
 %% "compile" the program 
 encode(Prog) when is_tuple(Prog) ->
@@ -307,7 +619,8 @@ print_bs(Bs) when is_record(Bs,bpf_bs) ->
 		fun(I) ->
 			print_insn_c("    ", -1, I)
 		end, B#bpf_block.insns),
-	      print_insn_c("    ", -1, B#bpf_block.next)
+	      print_insn_c("    ", -1, B#bpf_block.next),
+	      io:format("    cond ~w\n", [B#bpf_block.ncond])
       end, Bs),
     Bs.
 
@@ -406,15 +719,15 @@ print_jmp_c(true,k,I,L,J) ->
     if I#bpf_insn.k =:= 0 ->
 	    io:format("~snop;\n", [L]);
        true ->
-	    io:format("~sgoto L~.3.0w;\n", 
+	    io:format("~sgoto L~0w;\n", 
 		      [L,J+1+I#bpf_insn.k])
     end;
 print_jmp_c(Cond,k,I,L,J) ->
-    io:format("~sif (A ~s #0x~.16B) goto L~.3.0w; else goto L~.3.0w;\n", 
+    io:format("~sif (A ~s #0x~.16B) goto L~w; else goto L~w;\n", 
 	      [L,Cond,I#bpf_insn.k,
 	       J+1+I#bpf_insn.jt,J+1+I#bpf_insn.jf]);
 print_jmp_c(Cond,x,I,L,J) ->
-    io:format("~sif (A ~s X) goto L~.3.0w; else goto L~.3.0w;\n", 
+    io:format("~sif (A ~s X) goto L~w; else goto L~w;\n", 
 	      [L,Cond,
 	       J+1+I#bpf_insn.jt,J+1+I#bpf_insn.jf]).
 
@@ -544,14 +857,18 @@ optimise_bl_(Bs, I) when I>?MAX_OPTIMISE ->
     io:format("Looping optimiser (I>~w)\n", [?MAX_OPTIMISE]),
     print_bs(Bs);
 optimise_bl_(Bs, I) ->
-    io:format("OPTIMISE: ~w\n", [I]),
+    ?info("OPTIMISE: ~w\n", [I]),
     L = [fun remove_ld/1,
 	 fun remove_st/1,
 	 fun remove_multiple_jmp/1,
+	 fun normalise_return/1,
 	 fun remove_unreach/1,
 	 fun constant_propagation/1,
 	 fun bitfield_jmp/1,
-	 fun remove_unreach/1],
+	 fun remove_unreach/1,
+	 %% fun print_bs/1, 
+	 fun constant_path/1
+	],
     Bs1 = optimise_list_(L, Bs#bpf_bs { changed = 0 }),
     if Bs1#bpf_bs.changed =:= 0 ->
 	    print_bs(Bs1);
@@ -567,6 +884,7 @@ optimise_list_([], Bs) ->
 
 %% remove duplicate/unnecessary ld M[K] instructions or a sta
 remove_ld(Bs) when is_record(Bs,bpf_bs) ->
+    ?info("optimiser pass: remove_ld\n", []),
     bs_map_block(
       fun(B) ->B#bpf_block { insns=remove_ld_bl_(B#bpf_block.insns)} end,
       Bs).
@@ -580,63 +898,63 @@ remove_ld_bl_([I1=#bpf_insn { code=txa }, #bpf_insn {code=sta,k=K}|Is]) ->
 
 %% M[k]=A,X=M[k] =>  M[k]=A, X=A ; not that A=X must be kept!
 remove_ld_bl_([I1=#bpf_insn {code=sta,k=K},_I2=#bpf_insn { code=ldx,k=K}|Is]) ->
-    io:format("REMOVE: ~w\n", [_I2]),
+    ?debug("REMOVE: ~w\n", [_I2]),
     [I1 | remove_ld_bl_([#bpf_insn {code=tax}| Is])];
 
 %% M[k] = A, <opA>, A=M[k]  => M[k]=A [<opA]
 remove_ld_bl_([I1=#bpf_insn{code=sta,k=K},I2,_I3=#bpf_insn{code=lda,k=K}|Is]) ->
     case class(I2) of
 	{alu,_,_}    -> %% ineffective, remove I2,I3
-	    io:format("REMOVE: ~w\n", [I2]),
-	    io:format("REMOVE: ~w\n", [_I3]),
+	    ?debug("REMOVE: ~w\n", [I2]),
+	    ?debug("REMOVE: ~w\n", [_I3]),
 	    remove_ld_bl_([I1|Is]);
 	{misc,a,x}   -> %% ineffective, remove I2,I3
-	    io:format("REMOVE: ~w\n", [I2]),
-	    io:format("REMOVE: ~w\n", [_I3]),
+	    ?debug("REMOVE: ~w\n", [I2]),
+	    ?debug("REMOVE: ~w\n", [_I3]),
 	    remove_ld_bl_([I1|Is]);
 	{misc,x,a}   -> %% remove I3 since X is update to A
-	    io:format("REMOVE: ~w\n", [_I3]),
+	    ?debug("REMOVE: ~w\n", [_I3]),
 	    remove_ld_bl_([I1,I2|Is]);
 	{st,a,{k,K}} -> %% I1 = I2 remove I2,I3
-	    io:format("REMOVE: ~w\n", [I2]),
-	    io:format("REMOVE: ~w\n", [_I3]),
+	    ?debug("REMOVE: ~w\n", [I2]),
+	    ?debug("REMOVE: ~w\n", [_I3]),
 	    remove_ld_bl_([I1|Is]);
 	{st,_,_}     -> %% just remove I3
-	    io:format("REMOVE: ~w\n", [_I3]),
+	    ?debug("REMOVE: ~w\n", [_I3]),
 	    remove_ld_bl_([I1,I2|Is]);	    
 	{ld,x,_}     ->
-	    io:format("REMOVE: ~w\n", [_I3]),
+	    ?debug("REMOVE: ~w\n", [_I3]),
 	    remove_ld_bl_([I1,I2|Is]);
 	{ld,a,_}     -> %% A=<...>  A is reloaded in I3
-	    io:format("REMOVE: ~w\n", [I2]),
-	    io:format("REMOVE: ~w\n", [_I3]),
+	    ?debug("REMOVE: ~w\n", [I2]),
+	    ?debug("REMOVE: ~w\n", [_I3]),
 	    remove_ld_bl_([I1|Is])
     end;
 %% M[k]=X, INSN, X=M[k]  => M[k]=X, INSN
 remove_ld_bl_([I1=#bpf_insn{code=stx,k=K},I2,_I3=#bpf_insn{code=ldx,k=K}|Is]) ->
     case class(I2) of
 	{alu,_,_} ->   %% A += <...>  do not update X remove I3
-	    io:format("REMOVE: ~w\n", [_I3]),
+	    ?debug("REMOVE: ~w\n", [_I3]),
 	    remove_ld_bl_([I1,I2|Is]);
 	{misc,a,x} ->  %% A=X remove I3
-	    io:format("REMOVE: ~w\n", [_I3]),
+	    ?debug("REMOVE: ~w\n", [_I3]),
 	    remove_ld_bl_([I1,I2|Is]);
 	{misc,x,a} ->  %% X=A ineffective, remove I2,I3
-	    io:format("REMOVE: ~w\n", [I2]),
-	    io:format("REMOVE: ~w\n", [_I3]),
+	    ?debug("REMOVE: ~w\n", [I2]),
+	    ?debug("REMOVE: ~w\n", [_I3]),
 	    remove_ld_bl_([I1|Is]);
 	{st,x,{k,K}} -> %% I1=I2, duplicate, remove I2,I3
-	    io:format("REMOVE: ~w\n", [I2]),
-	    io:format("REMOVE: ~w\n", [_I3]),
+	    ?debug("REMOVE: ~w\n", [I2]),
+	    ?debug("REMOVE: ~w\n", [_I3]),
 	    remove_ld_bl_([I1|Is]);
 	{st,x,_} ->     %% remove I3
-	    io:format("REMOVE: ~w\n", [_I3]),
+	    ?debug("REMOVE: ~w\n", [_I3]),
 	    remove_ld_bl_([I1,I2|Is]);
 	{ld,a,_} ->     %% A=<..>, keep x is not updated
 	    remove_ld_bl_([I1,I2|Is]);
 	{ld,x,_}     -> %% X=<..>  X is reloaded in I3 
-	    io:format("REMOVE: ~w\n", [I2]),
-	    io:format("REMOVE: ~w\n", [_I3]),
+	    ?debug("REMOVE: ~w\n", [I2]),
+	    ?debug("REMOVE: ~w\n", [_I3]),
 	    remove_ld_bl_([I1|Is])
     end;
 remove_ld_bl_([I|Is]) ->
@@ -644,17 +962,11 @@ remove_ld_bl_([I|Is]) ->
 remove_ld_bl_([]) ->
     [].
 
-
-%% remove unnecessary sta|stx instructions ( M[K]=A|X )
-%% remove:
-%%    M[k]=A     sta, if M[k] is never referenced (before killed)
-%%    M[k]=X     stx, if M[k] is never referenced (before killed)
-%%    A=X        txa  if A is never reference (before killed)
-%%    A=<const>  ldc, if A is never reference (before killed)
-%%    X=A        tax, if X is never reference (before killed)
-%%    X=<const>  ldx, if X is never reference (before killed)
+%%
+%% remove unnecessary sta|stx instructions (see OPTIMISE.md)
 %%
 remove_st(Bs) when is_record(Bs,bpf_bs) ->
+    ?info("optimiser pass: remove_st\n", []),
     bs_map_block(fun(B) -> remove_st_bl_(B, Bs) end, Bs).
 
 remove_st_bl_(B, Bs) ->
@@ -663,7 +975,7 @@ remove_st_bl_(B, Bs) ->
 remove_st_bl__([I | Is], B, Bs) ->
     case is_referenced_st(I, Is, B, Bs) of
 	false ->
-	    io:format("REMOVE: ~w\n", [I]),
+	    ?debug("REMOVE: ~w\n", [I]),
 	    remove_st_bl__(Is, B, Bs);
 	true ->
 	    [I | remove_st_bl__(Is, B, Bs)]
@@ -680,6 +992,8 @@ is_referenced_st(I, Is, B, Bs) ->
 	    is_referenced_a(Is,B,Bs);
 	{ld,x,_} ->
 	    is_referenced_x(Is,B,Bs);
+	{alu,_,_} ->
+	    is_referenced_a(Is,B,Bs);
 	{misc,a,_} -> %% (txa A=X)
 	    is_referenced_a(Is,B,Bs);
 	{misc,x,_} -> %% (tax X=A)
@@ -811,20 +1125,10 @@ loop_insns_(Fun,Acc,[],As,B,Bs,Vs) ->
     end.
 
 %%
-%% Find bitfield & optimise jumps:
-%% A)
-%%    A >>= 0x1;
-%%    A &= 0x1;
-%%    if (A > 0x0) goto L1; else goto L2;
-%% ==>
-%%    if (A & 0x02) goto L1; else goto L2;  (if A is not referenced in L1/L2)
-%% B)
-%%    A &= 0x10;
-%%    if (A > 0x0) goto L1; else goto L2;
-%% ==>    
-%%    if (A > 0x10) goto L1; else goto L2;
+%% Find bitfield & optimise jumps: (see OPTIMISE.md)
 %%
 bitfield_jmp(Bs) when is_record(Bs,bpf_bs) ->
+    ?info("optimiser pass: bitfield_jmp\n", []),
     bs_fold_block(fun(B,Bsi) -> bitfield_jmp_bl_(B, Bsi) end, Bs, Bs).
 
 bitfield_jmp_bl_(B, Bs) ->
@@ -832,13 +1136,13 @@ bitfield_jmp_bl_(B, Bs) ->
 	[#bpf_insn{ code=andk, k=1 }, #bpf_insn{ code=rshk, k=K } | Is] ->
 	    case B#bpf_block.next of
 		N = #bpf_insn { code=jgtk, k=0 } ->
-		    io:format("BITFIELD 1\n"),
+		    ?info("Optimisation bitfield 6.a\n", []),
 		    case is_referenced_aj([N#bpf_insn.jt,N#bpf_insn.jf],Bs) of
 			true ->
-			    io:format(" REFERENCED\n"),
+			    ?debug(" REFERENCED\n", []),
 			    Bs;
 			false ->
-			    io:format(" UPDATED\n"),
+			    ?debug(" UPDATED\n", []),
 			    N1 = N#bpf_insn { code=jsetk, k=(1 bsl K) },
 			    B1 = B#bpf_block { insns=reverse(Is),
 					       next = N1},
@@ -849,14 +1153,36 @@ bitfield_jmp_bl_(B, Bs) ->
 	    end;
 	[#bpf_insn{ code=andk, k=Km } | Is] ->
 	    case B#bpf_block.next of
+		#bpf_insn { code=jeqk, k=Km, jt=L1, jf=L3 } ->
+		    Bt = bs_get_block(L1,Bs),
+		    case {Bt#bpf_block.insns,Bt#bpf_block.next} of
+			{[],N1=#bpf_insn { code=jsetk, k=Kl, jt=L2, jf=L3} } ->
+			    ?info("Optimisation bitfield 6.f\n", []),
+			    case is_referenced_aj([L2,L3],Bs) of
+				true ->
+				    ?debug(" REFERENCED\n",[]),
+				    Bs;
+				false ->
+				    ?debug(" UPDATED\n",[]),
+				    Kn = Km bor Kl,
+				    I1=#bpf_insn {code=andk, k=Kn},
+				    N2 = N1#bpf_insn { code=jeqk, k=Kn },
+				    B1 = B#bpf_block { insns=reverse([I1|Is]),
+						       next = N2},
+				    bs_set_block(B1, Bs)
+			    end;
+			_ ->
+			    Bs
+		    end;
+
 		N = #bpf_insn { code=jgtk, k=0 } ->
-		    io:format("BITFIELD 1\n"),
+		    ?info("Optimisation bitfield 6.b\n", []),
 		    case is_referenced_aj([N#bpf_insn.jt,N#bpf_insn.jf],Bs) of
 			true ->
-			    io:format(" REFERENCED\n"),
+			    ?debug(" REFERENCED\n",[]),
 			    Bs;
 			false ->
-			    io:format(" UPDATED\n"),
+			    ?debug(" UPDATED\n",[]),
 			    N1 = N#bpf_insn { code=jsetk, k=Km },
 			    B1 = B#bpf_block { insns=reverse(Is),
 					       next = N1},
@@ -865,14 +1191,60 @@ bitfield_jmp_bl_(B, Bs) ->
 		_ ->
 		    Bs
 	    end;
-	_ ->
-	    Bs
+
+	[#bpf_insn{ code=rshk, k=K } | Is] ->
+	    case B#bpf_block.next of
+		N = #bpf_insn { code=jsetk, k=1 } ->
+		    ?info("Optimisation bitfield 6.c\n", []),
+		    case is_referenced_aj([N#bpf_insn.jt,N#bpf_insn.jf],Bs) of
+			true ->
+			    ?debug(" REFERENCED\n",[]),
+			    Bs;
+			false ->
+			    ?debug(" UPDATED\n",[]),
+			    N1 = N#bpf_insn { code=jsetk, k=(1 bsl K) },
+			    B1 = B#bpf_block { insns=reverse(Is),
+					       next = N1},
+			    bs_set_block(B1, Bs)
+		    end;
+		_ ->
+		    Bs
+	    end;
+	Is ->
+	    case B#bpf_block.next of
+		#bpf_insn { code=jsetk,k=Km,jt=L2,jf=L1} ->
+		    Bf = bs_get_block(L1,Bs),
+		    Bt = bs_get_block(L2,Bs),
+		    case {Bf#bpf_block.insns,Bf#bpf_block.next} of
+			{[],#bpf_insn { code=jsetk,k=Kl,jt=L2,jf=L3} } ->
+			    ?info("Optimisation bitfield 6.d\n", []),
+			    Kn = Km bor Kl,
+			    N=#bpf_insn { code=jsetk,jt=L2,jf=L3,k=Kn},
+			    bs_set_next(B#bpf_block.label, N, Bs);
+			_ ->
+			    case {Bt#bpf_block.insns,Bt#bpf_block.next} of
+				{[],#bpf_insn {code=jsetk,k=Kl,jt=L3,jf=L1} } ->
+				    ?info("Optimisation bitfield 6.e\n", []),
+				    Kn = Km bor Kl,
+				    I=#bpf_insn { code=andk,k=Kn},
+				    N=#bpf_insn { code=jeqk,jt=L3,jf=L1,k=Kn},
+				    B1=B#bpf_block { insns=reverse([I|Is]),
+						     next=N },
+				    bs_set_block(B1, Bs);
+				_ ->
+				    Bs
+			    end
+		    end;
+		_ ->
+		    Bs
+	    end
     end.
 
 %%
 %% remove multiple unconditional jumps 
 %%
 remove_multiple_jmp(Bs) when is_record(Bs,bpf_bs) ->
+    ?info("optimiser pass: remove_multiple_jmp\n", []),
     bs_fold_block(fun(B,BsI) -> remove_multiple_jmp_bl_(B, BsI) end, Bs, Bs).
 
 %% 1 - fanout is unconditional jump 
@@ -885,8 +1257,8 @@ remove_multiple_jmp_bl_(B, Bs) ->
 	[J] ->
 	    Bj = bs_get_block(J, Bs),
 	    if Bj#bpf_block.insns =:= [] ->
-		    io:format("REPLACE: ~w with ~w\n",
-			      [B#bpf_block.next,Bj#bpf_block.next]),
+		    ?debug("REPLACE: ~w with ~w\n",
+			   [B#bpf_block.next,Bj#bpf_block.next]),
 		    bs_set_next(B#bpf_block.label, Bj#bpf_block.next, Bs);
 	       true ->
 		    Bs
@@ -919,7 +1291,7 @@ remove_multiple_jmp_bl_(B, Bs) ->
 	    if Jt =/= Jt2; Jf =/= Jf2 ->
 		    Next = B#bpf_block.next,
 		    Next1 = Next#bpf_insn { jt=Jt2, jf=Jf2 },
-		    io:format("REPLACE: ~w with ~w\n", [Next,Next1]),
+		    ?debug("REPLACE: ~w with ~w\n", [Next,Next1]),
 		    bs_set_next(B#bpf_block.label, Next1, Bs);
 	       true ->
 		    Bs
@@ -929,9 +1301,55 @@ remove_multiple_jmp_bl_(B, Bs) ->
     end.
 
 %%
+%% Normalize return blocks (block with only a return statement)
+%%
+normalise_return(Bs) when is_record(Bs,bpf_bs) ->
+    ?info("optimiser pass: normalise_return\n", []),
+    LKs0 =
+	bs_fold_block(
+	  fun(B,Acc) when B#bpf_block.insns =:= [] ->
+		  N = B#bpf_block.next,
+		  case N#bpf_insn.code of
+		      retk -> [{N#bpf_insn.k,B#bpf_block.label} | Acc];
+		      reta -> [{a,B#bpf_block.label} | Acc];
+		      _ -> Acc
+		  end;
+	     (_, Acc) ->
+		  Acc
+	  end, [], Bs),
+    LKs = lists:reverse(lists:keysort(2, LKs0)),
+    bs_map_block(
+	fun(B) ->
+		N = B#bpf_block.next,
+		N1 =
+		    case class(N) of
+			{jmp,true,_} ->
+			    J = find_normal_label(N#bpf_insn.k,LKs),
+			    N#bpf_insn { k = J };
+			{jmp,_Cond,_} ->
+			    Jt = find_normal_label(N#bpf_insn.jt,LKs),
+			    Jf = find_normal_label(N#bpf_insn.jf,LKs),
+			    N#bpf_insn { jt=Jt, jf=Jf };
+			{ret,_} ->
+			    N
+		    end,
+		B#bpf_block { next=N1 }
+	end, Bs).
+		
+    
+find_normal_label(K, LKs) ->
+    case lists:keyfind(K, 2, LKs) of
+	false -> K;
+	{V,K} ->
+	    {V,K1} =lists:keyfind(V,1,LKs),  %% find first
+	    K1
+    end.
+
+%%
 %% Remove unreachable blocks
 %%
 remove_unreach(Bs) when is_record(Bs,bpf_bs) ->
+    ?info("optimiser pass: remove_unreach\n", []),
     remove_unreach_([Bs#bpf_bs.init], Bs, sets:new()).
 
 remove_unreach_([I|Is], Bs, Vs) ->
@@ -948,7 +1366,7 @@ remove_unreach_([], Bs, Vs) ->
     All = bs_get_labels(Bs),
     Remove = All -- sets:to_list(Vs),
     lists:foldl(fun(I,Bsi) -> 
-			io:format("REMOVE BLOCK: ~w\n", [I]),
+			?debug("REMOVE BLOCK: ~w\n", [I]),
 			bs_del_block(I, Bsi) end, 
 		Bs, Remove).
 
@@ -957,10 +1375,11 @@ remove_unreach_([], Bs, Vs) ->
 %%     for each node 
 %%     recursive calculate the constants for all
 %%     fan in. 
-%%     calculate the union of all constants
-%%     and proceed then do the block 
+%%     Calculate the union of all constants
+%%     and then proceed to calculate the block 
 %%
 constant_propagation(Bs) when is_record(Bs,bpf_bs) ->
+    ?info("optimiser pass: constant_propagation\n", []),
     Ls = bs_get_labels(Bs),
     {Bs1,_,_} = constant_propagation_(Ls, Bs, dict:new(), sets:new()),
     Bs1.
@@ -971,10 +1390,8 @@ constant_propagation_([I|Is], Bs, Ds, Vs) ->
 	true ->
 	    constant_propagation_(Is,Bs,Ds,Vs);
 	false ->
-	    %% io:format("find label = ~w\n", [I]),
 	    B0 = bs_get_block(I, Bs),
 	    FanIn = bs_get_fanin(I, Bs),
-	    %% io:format("I=~w fanin=~w\n", [I, FanIn]),
 	    Vs1 = sets:add_element(I,Vs),
 	    {Bs1,Ds1,Vs2} = constant_propagation_(FanIn,Bs,Ds,Vs1),
 	    D0 = constant_intersect_(FanIn,Ds1),
@@ -985,21 +1402,143 @@ constant_propagation_([I|Is], Bs, Ds, Vs) ->
 constant_propagation_([],Bs,Ds,Vs) ->
     {Bs,Ds,Vs}.
 
-%% constant propagate instructions in block B given values in 
+%% constant propagate instructions in block B given values in
 %% dictionary D
 constant_eval_(B, D) ->
-    io:format("EVAL: ~w\n", [B#bpf_block.label]),
+    ?debug("EVAL: ~w D=~w\n", [B#bpf_block.label, dict:to_list(D)]),
     {Is,D1} = constant_ev_(B#bpf_block.insns,[],D),
-    Next = constant_ev_jmp_(B#bpf_block.next, D1),
+    {Next,NCond} = constant_ev_jmp_(B#bpf_block.next, D1),
     if Next =/= B#bpf_block.next ->
-	    io:format("Replace: ~w with ~w\n", [B#bpf_block.next, Next]);
+	    ?debug("Replaced: ~w with ~w\n", [B#bpf_block.next, Next]);
        true -> ok
     end,
-    {B#bpf_block { insns = Is, next=Next }, D1}.
+    {B#bpf_block { insns = Is, next=Next, ncond=NCond }, D1}.
 
+%%
+%% Constant path
+%%
+constant_path(Bs) when is_record(Bs,bpf_bs) ->
+    ?info("optimiser pass: constant_path\n", []),
+    Ls = bs_get_labels(Bs),
+    {Bs1,_} = constant_path_(Ls, Bs, sets:new()),
+    Bs1.
+
+%% Ds is dict of dicts of block calculations, Vs is set of visited nodes
+constant_path_([I|Is], Bs, Vs) ->
+    case sets:is_element(I, Vs) of
+	true ->
+	    constant_path_(Is,Bs,Vs);
+	false ->
+	    B0 = bs_get_block(I, Bs),
+	    FanIn = bs_get_fanin(I, Bs),
+	    Vs1 = sets:add_element(I,Vs),
+	    {Bs1,Vs2} = constant_path_(FanIn,Bs,Vs1),
+	    {B1,Bs2} = constant_block_(B0,Bs1),
+	    constant_path_(Is, bs_set_block(B1,Bs2),Vs2)
+    end;
+constant_path_([],Bs,Vs) ->
+    {Bs,Vs}.
+
+constant_block_(B, Bs) ->
+    %% check all paths to this block to see if they may be patched
+    Next = B#bpf_block.next,
+    case class(Next) of
+	{jmp,true,_} ->
+	    {B, Bs};
+	{jmp,_,_} ->
+	    %% check if ncond is patch among parents and update
+	    L = B#bpf_block.label,
+	    Cond = B#bpf_block.ncond,
+	    case compare_all_conds_(bs_get_fanin(L, Bs), L, Cond, Bs) of
+		undefined ->
+		    %% try forward patch
+		    Bf = bs_get_block(Next#bpf_insn.jf, Bs),
+		    case compare_cond(Cond, Bf#bpf_block.ncond) of
+			true ->
+			    Nf = Bf#bpf_block.next,
+			    Next1 = Next#bpf_insn { jf=Nf#bpf_insn.jf },
+			    B1 = B#bpf_block { next = Next1 },
+			    {B1, Bs};
+			false ->
+			    {B,Bs};  %% hmm?
+			undefined ->
+			    Bt = bs_get_block(Next#bpf_insn.jt, Bs),
+			    case compare_cond(Cond, Bt#bpf_block.ncond) of
+				true ->
+				    Nt = Bt#bpf_block.next,
+				    Next1 = Next#bpf_insn { jt=Nt#bpf_insn.jt },
+				    B1 = B#bpf_block { next = Next1 },
+				    {B1, Bs};
+				false ->
+				    {B,Bs};  %% hmm?
+				undefined ->
+				    {B,Bs}
+			    end
+		    end;
+		true ->
+		    Next1 = #bpf_insn { code=jmp, k = Next#bpf_insn.jt },
+		    B1 = B#bpf_block { next = Next1, ncond = true },
+		    {B1, Bs};
+		false ->
+		    Next1 = #bpf_insn { code=jmp, k = Next#bpf_insn.jf },
+		    B1 = B#bpf_block { next = Next1, ncond = true },
+		    {B1, Bs}
+	    end;
+	_ ->
+	    {B, Bs}
+    end.
+		    
+%%
+%% given label L check generate a list of all parent paths
+%% to check if Cond is true or false or undefined
+%% Cond must either be true in all parent or false in all parents
+%% or it is undefined
+compare_cond_(L, L0, Cond, Bs) ->
+    B = bs_get_block(L, Bs),
+    %% first seach grand parents
+    case compare_all_conds_(bs_get_fanin(B#bpf_block.label, Bs), L, Cond, Bs) of
+	undefined ->
+	    Next = B#bpf_block.next,
+	    Negate = (Next#bpf_insn.jf == L0),
+	    compare_cond(Cond, B#bpf_block.ncond, Negate);
+	true  -> true;
+	false -> false
+    end.
+
+compare_all_conds_([], _L0, _Cond, _Bs) ->
+    undefined;
+compare_all_conds_([L|Ls], L0, Cond, Bs) ->
+    case compare_cond_(L, L0, Cond, Bs) of
+	true -> compare_all_conds_(Ls, L0, Cond, true, Bs);
+	false -> compare_all_conds_(Ls, L0, Cond, false, Bs);
+	undefined -> undefined
+    end.
+
+compare_all_conds_([], _L0, _Cond,  Value, _Bs) ->
+    Value;
+compare_all_conds_([L|Ls], L0, Cond, Value, Bs) ->
+    case compare_cond_(L, L0, Cond, Bs) of
+	Value -> compare_all_conds_(Ls, L0, Cond, Value, Bs);
+	_ -> undefined
+    end.
+
+compare_cond(A, B, true) ->
+    case compare_cond(A, B) of
+	true -> false;
+	false -> true;
+	undefined -> undefined
+    end;
+compare_cond(A, B, false) ->
+    compare_cond(A, B).
+
+compare_cond(true, _A) -> undefined;
+compare_cond(_A, true) -> undefined;
+compare_cond(A, A) -> true;
+compare_cond({'>',A,B}, {'>',B,A}) -> false;
+compare_cond(_, _) -> undefined.
+    
 
 constant_ev_([I|Is],Js,D) ->
-    %% io:format("  EV: ~w in dict=~w\n", [I, dict:to_list(D)]),
     K = I#bpf_insn.k,
     case I#bpf_insn.code of
 	ldaw ->
@@ -1009,11 +1548,35 @@ constant_ev_([I|Is],Js,D) ->
 	ldab ->
 	    constant_set_(I, Is, Js, a, {p,K,1}, D);
 	ldiw ->
-	    constant_set_(I, Is, Js, a, {p,get_reg(x,D),K,4}, D);
+	    case get_pind(K,4,D) of
+		{p,X,K,N} when is_integer(X) ->
+		    K1 = X+K,
+		    I1 = I#bpf_insn{code=ldaw, k=K1},
+		    ?debug("CHANGE: ~w TO ~w\n", [I, I1]),
+		    constant_set_(I1,Is,Js,a,{p,K1,N},D);
+		P ->
+		    constant_set_(I, Is, Js, a, P, D)
+	    end;
 	ldih ->
-	    constant_set_(I, Is, Js, a, {p,get_reg(x,D),K,2}, D);
+	    case get_pind(K,2,D) of
+		{p,X,K,N} when is_integer(X) ->
+		    K1 = X+K,
+		    I1 = I#bpf_insn{code=ldah, k=K1},
+		    ?debug("CHANGE: ~w TO ~w\n", [I, I1]),
+		    constant_set_(I1,Is,Js,a,{p,K1,N},D);
+		P ->
+		    constant_set_(I, Is, Js, a, P, D)
+	    end;
 	ldib ->
-	    constant_set_(I, Is, Js, a, {p,get_reg(x,D),K,1}, D);
+	    case get_pind(K,1,D) of
+		{p,X,K,N} when is_integer(X) ->
+		    K1 = X+K,
+		    I1 = I#bpf_insn{code=ldab, k=K1},
+		    ?debug("CHANGE: ~w TO ~w\n", [I, I1]),
+		    constant_set_(I1,Is,Js,a,{p,K1,N},D);
+		P ->
+		    constant_set_(I, Is, Js, a, P, D)
+	    end;
 	ldl  ->
 	    constant_set_(I, Is, Js, a, {l,4}, D);
 	ldc  ->
@@ -1022,7 +1585,7 @@ constant_ev_([I|Is],Js,D) ->
 	    case get_reg({m,K},D) of
 		K1 when is_integer(K1) ->
 		    I1 = I#bpf_insn{code=ldc,k=K1},
-		    io:format("CHANGE: ~w TO ~w\n", [I, I1]),
+		    ?debug("CHANGE: ~w TO ~w\n", [I, I1]),
 		    constant_ev_(Is,[I1|Js],set_reg(a,K1,D));
 		R ->
 		    constant_ev_(Is,[I|Js], set_reg(a,R,D))
@@ -1034,7 +1597,7 @@ constant_ev_([I|Is],Js,D) ->
 	    case get_reg({m,K}, D) of
 		K1 when is_integer(K1) ->
 		    I1 = I#bpf_insn{code=ldxc,k=K1},
-		    io:format("CHANGE: ~w TO ~w\n", [I, I1]),
+		    ?debug("CHANGE: ~w TO ~w\n", [I, I1]),
 		    constant_ev_(Is,[I1|Js], set_reg(x,K1,D));
 		R ->
 		    constant_ev_(Is,[I|Js], set_reg(x,R,D))
@@ -1042,7 +1605,8 @@ constant_ev_([I|Is],Js,D) ->
 	ldxl ->
 	    constant_set_(I, Is, Js, x, {l,4}, D);
 	ldxmsh -> 
-	    constant_set_(I, Is, Js, x, {msh,K}, D);
+	    Msh = {'*',4,{'&',{p,K,1},15}},
+	    constant_set_(I, Is, Js, x, Msh, D);
 	sta  ->
 	    constant_ev_(Is, [I|Js], set_reg({m,K},get_reg(a,D),D));
 	stx  ->
@@ -1072,68 +1636,90 @@ constant_ev_([], Js, D) ->
 
 %% set register to value if not already set, then remove the instruction
 constant_set_(I, Is, Js, R, V, D) ->
-    case get_reg(R, D) of
+    case get_ureg(R, D) of
 	undefined -> %% no value defined
 	    constant_ev_(Is,[I|Js], set_reg(R, V, D));
 	V -> %% value already loaded
-	    io:format("REMOVE: ~w, value ~w already set\n", [I,V]),
+	    ?debug("REMOVE: ~w, value ~w already set\n", [I,V]),
 	    constant_ev_(Is,Js,D);
 	_ ->
 	    constant_ev_(Is,[I|Js], set_reg(R, V, D))
     end.
 
 constant_ev_jmp_(I, D) ->
-    %% io:format("  EV_JMP: ~w in dict=~w\n", [I, dict:to_list(D)]),
     case I#bpf_insn.code of
-	retk -> I;
-	reta -> I;
-	jmp  -> I;
-	jgtk  -> constant_ev_jmpk_(I,fun(A,K) -> A > K end,D);
-	jgek  -> constant_ev_jmpk_(I,fun(A,K) -> A >= K end,D);
-	jeqk  -> constant_ev_jmpk_(I,fun(A,K) -> A =:= K end,D);
-	jsetk -> constant_ev_jmpk_(I,fun(A,K) -> (A band K) =/= 0 end,D);
-	jgtx  -> constant_ev_jmpx_(I,fun(A,X) -> A > X end, jgtk,D);
-	jgex  -> constant_ev_jmpx_(I,fun(A,X) -> A >= X end, jgek,D);
-	jeqx  -> constant_ev_jmpx_(I,fun(A,X) -> A =:= X end, jeqk,D);
-	jsetx -> constant_ev_jmpx_(I,fun(A,X) -> (A band X) =/= 0 end,jsetk,D)
+	retk -> {I,true};
+	reta -> {I,true};
+	jmp  -> {I,true};
+	jgtk  -> constant_ev_jmpk_(I,'>',D);
+	jgek  -> constant_ev_jmpk_(I,'>=',D);
+	jeqk  -> constant_ev_jmpk_(I,'==',D);
+	jsetk -> constant_ev_jmpk_(I,'&',D);
+	jgtx  -> constant_ev_jmpx_(I,'>', jgtk,D);
+	jgex  -> constant_ev_jmpx_(I,'>=',jgek,D);
+	jeqx  -> constant_ev_jmpx_(I,'==',jeqk,D);
+	jsetx -> constant_ev_jmpx_(I,'&',jsetk,D)
     end.
 
-constant_ev_jmpk_(I=#bpf_insn { jt=Jt, jf=Jf, k=K }, Cmp, D) ->
-    case get_reg(a, D) of
-	A when is_integer(A) ->
-	    I1 = case Cmp(A,K) of
-		     true  -> #bpf_insn { code=jmp, k=Jt };
-		     false -> #bpf_insn { code=jmp, k=Jf }
-		 end,
-	    io:format("CHANGE: ~w TO ~w\n", [I, I1]),
-	    I1;
-	_R -> I
-    end.
+comp_('>',A,B) when is_integer(A), is_integer(B) -> A > B;
+comp_('>=',A,B) when is_integer(A), is_integer(B) -> A >= B;
+comp_('==',A,B) when is_integer(A), is_integer(B) -> A =:= B;
+comp_('==',A,B) -> match_(A,B);
+comp_('&',A,B) when is_integer(A), is_integer(B) -> (A band B) =/= 0;
+comp_(_,_,_) -> false.
 
-constant_ev_jmpx_(I=#bpf_insn { jt=Jt, jf=Jf },Cmp,JmpK,D) ->
-    case get_reg(a, D) of
-	A when is_integer(A) ->
-	    case get_reg(x, D) of
-		X when is_integer(X) ->
-		    I1 = case Cmp(A,X) of
-			     true  -> #bpf_insn { code=jmp, k=Jt };
-			     false -> #bpf_insn { code=jmp, k=Jf }
-			 end,
-		    io:format("CHANGE: ~w TO ~w\n", [I, I1]),
-		    I1;
-		_ -> 
-		    I
-	    end;
-	_ ->
-	    case get_reg(x, D) of
-		X when is_integer(X) -> 
-		    I1 = I#bpf_insn { code=JmpK, k=X },
-		    io:format("CHANGE: ~w TO ~w\n", [I, I1]),
-		    I1;
-		_ ->
-		    I
+match_(A,B) ->
+    match_(A,B,"").
+
+match_(A,B,I) ->
+    ?debug("~sMATCH ~w, ~w\n", [I,A,B]),
+    R = match__(A,B,["  ",I]),
+    ?debug("~s=~w\n", [I,R]),
+    R.
+
+match__(undefined,_,_) -> false;
+match__(_,undefined,_) -> false;
+match__(A,A,_) -> true;
+match__({'+',A,B},{'+',C,D},I) ->
+    (match_(A,C,I) andalso match_(B,D,I)) 
+	orelse
+	  (match_(A,D,I) andalso match_(B,C,I));
+match__({'*',A,B},{'*',C,D},I) ->
+    (match_(A,C,I) andalso match_(B,D,I)) 
+	orelse
+	  (match_(A,D,I) andalso match_(B,C,I));
+match__(_, _,_) ->
+    false.
+
+constant_ev_jmpk_(I=#bpf_insn { jt=Jt, jf=Jf, k=K },Op,D) ->
+    A = get_reg(a, D),
+    case comp_(Op,A,K) of
+	true  -> 
+	    {#bpf_insn { code=jmp, k=Jt }, true};
+	false ->
+	    if is_integer(A) ->
+		    {#bpf_insn { code=jmp, k=Jf }, true};
+	       true ->
+		    {I, {Op,A,K}}
 	    end
     end.
+
+constant_ev_jmpx_(I=#bpf_insn { jt=Jt, jf=Jf },Op,JmpK,D) ->
+    A = get_reg(a, D),
+    X = get_reg(x, D),
+    case comp_(Op,A,X) of
+	true ->
+	    {#bpf_insn { code=jmp, k=Jt },true};
+	false ->
+	    if is_integer(A), is_integer(X) ->
+		    {#bpf_insn { code=jmp, k=Jf },true};
+	       is_integer(X) ->
+		    {I#bpf_insn { code=JmpK, k=X },true};
+	       true ->
+		    {I,{Op,A,X}}
+	    end
+    end.
+
 
 %% translate operation depending on outcome of calculation
 eval_op_(I, Is, Js, D, Op, R, A, Op1, Op2) ->
@@ -1141,7 +1727,7 @@ eval_op_(I, Is, Js, D, Op, R, A, Op1, Op2) ->
 	K1 when is_integer(K1) ->
 	    D1 = set_reg(R,K1,D),
 	    I1 = I#bpf_insn { code=Op1, k=K1},
-	    io:format("CHANGE: ~w TO ~w\n", [I, I1]),
+	    ?debug("CHANGE: ~w TO ~w\n", [I, I1]),
 	    constant_ev_(Is, [I1|Js], D1);
 	V1 ->
 	    D1 = set_reg(R,V1,D),
@@ -1151,25 +1737,25 @@ eval_op_(I, Is, Js, D, Op, R, A, Op1, Op2) ->
 		    %% Try remove noops, more?
 		    case Op2 of
 			subk when K0 =:= 0 ->
-			    io:format("REMOVE: ~w\n", [I1]),
+			    ?debug("REMOVE: ~w\n", [I1]),
 			    constant_ev_(Is, Js, D1);
 			addk when K0 =:= 0 ->
-			    io:format("REMOVE: ~w\n", [I1]),
+			    ?debug("REMOVE: ~w\n", [I1]),
 			    constant_ev_(Is, Js, D1);
 			mulk when K0 =:= 1 ->
-			    io:format("REMOVE: ~w\n", [I1]),
+			    ?debug("REMOVE: ~w\n", [I1]),
 			    constant_ev_(Is, Js, D1);
 			divk when K0 =:= 1 ->
-			    io:format("REMOVE: ~w\n", [I1]),
+			    ?debug("REMOVE: ~w\n", [I1]),
 			    constant_ev_(Is, Js, D1);
 			lshk when K0 =:= 0 ->
-			    io:format("REMOVE: ~w\n", [I1]),
+			    ?debug("REMOVE: ~w\n", [I1]),
 			    constant_ev_(Is, Js, D1);
 			rshk when K0 =:= 0 ->
-			    io:format("REMOVE: ~w\n", [I1]),
+			    ?debug("REMOVE: ~w\n", [I1]),
 			    constant_ev_(Is, Js, D1);
 			_ ->
-			    io:format("CHANGE: ~w TO ~w\n", [I, I1]),
+			    ?debug("CHANGE: ~w TO ~w\n", [I, I1]),
 			    constant_ev_(Is, [I1|Js], D1)
 		    end;
 		_ ->
@@ -1182,7 +1768,7 @@ eval_op_(I, Is, Js, D, Op, R, OpK) ->
 	K1 when is_integer(K1) ->
 	    D1 = set_reg(R,K1,D),
 	    I1 = I#bpf_insn { code=OpK, k=K1},
-	    io:format("CHANGE: ~w TO ~w\n", [I, I1]),
+	    ?debug("CHANGE: ~w TO ~w\n", [I, I1]),
 	    constant_ev_(Is, [I1|Js], D1);
 	V1 ->
 	    D1 = set_reg(R,V1,D),
@@ -1196,27 +1782,39 @@ set_reg(R, V, D) ->
     %% io:format("set_reg: ~w = ~w\n", [R, V]),
     dict:store(R, V, D).
 
-get_reg(R, _D) when is_integer(R) ->
-    %% io:format("get_reg: ~w\n", [R]),
-    R;
-get_reg(R, D) ->
-    case dict:find(R, D) of
-	{ok,V} -> 
-	    %% io:format("get_reg: ~w = ~w\n", [R,V]),
-	    V;
-	error ->
-	    %% io:format("get_reg: ~w = undefined\n", [R]),
-	    undefined
+%% get the value of {p,X,K,N}  (K is constant, N=1,2|4)
+get_pind(K,N,D) ->
+    case get_ureg(x,D) of
+	undefined ->
+	    ?warning("get_reg: ~w = undefined!!\n", [x]),
+	    undefined;
+	X -> {p,X,K,N}
     end.
+
+get_reg(R, D) ->
+    case get_ureg(R, D) of
+	undefined ->
+	    ?warning("get_reg: ~w = undefined!!\n", [R]),
+	    undefined;
+	V -> V
+    end.
+
+%% caller knows that R may be undefined, 
+get_ureg(R, _D) when is_integer(R) -> R;
+get_ureg(R, D) ->
+    case dict:find(R, D) of
+	{ok,V} ->  V;
+	error -> undefined
+    end.
+    
+    
 
 eval_reg(Op,A,B,D) ->
     V = eval_reg_(Op, get_reg(A,D), get_reg(B,D)),
-    %% io:format("eval_reg: (~w ~s ~w) = ~w\n", [Op,A,B,V]),
     V.
 
 eval_reg(Op,A,D) ->
     V = eval_reg_(Op, get_reg(A,D)),
-    %% io:format("eval_reg: ~s ~w = ~w\n", [Op,A,V]),
     V.    
 
 eval_reg_('*', 0, _) -> 0;
@@ -1271,24 +1869,25 @@ dict_intersect(A, B) ->
 	      case dict:is_key(K,B) of
 		  true ->
 		      Vb = dict:fetch(K,B),
-		      case intersect_value(Va,Vb) of
-			  {true,Vc} ->
-			      dict:store(K, Vc, C);
-			  false ->
-			      C
-		      end;
+		      Vc = merge_value(Va,Vb),
+		      dict:store(K, Vc, C);
 		  false ->
 		      C
 	      end
       end, dict:new(), A).
 
-%% simple version true only if values are identical
-intersect_value(X, X) ->    
-    {true,X};
-intersect_value(X,Y) ->	
-    io:format("intersect: ~w ~w => false\n", [X,Y]),
-    false.
-
+merge_value({union,As},{union,Bs}) ->
+    {union,As++Bs};
+merge_value({union,As}, B) ->
+    {union,As++[B]};
+merge_value(A, {union,Bs}) ->
+    {union,[A]++Bs};
+merge_value(A, B) ->
+    case match_(A,B) of
+	true  -> A;
+	false -> {union,[A,B]}
+    end.
+	    
 %%
 %% Create basic block representation from tuple program.
 %% The labels will initially be the address of the first
@@ -1471,7 +2070,7 @@ exec0(Prog,Pc,A,X,P,M) ->
 	if (K) >= 0, (K) < tuple_size((M)) ->
 		element((K)+1, (M));
 	   true -> 
-		io:format("mem index out of bounds, ~w\n", [(K)]),
+		?error("mem index out of bounds, ~w\n", [(K)]),
 		throw(mem_index)
 	end).
 
@@ -1479,14 +2078,14 @@ exec0(Prog,Pc,A,X,P,M) ->
 	if (K) >= 0, K < tuple_size((M)) ->
 		setelement((K)+1,(M),?uint32((V)));
 	   true -> 
-		io:format("mem index out of bounds, ~w\n", [(K)]),
+		?error("mem index out of bounds, ~w\n", [(K)]),
 		throw(mem_index)
 	end).
 
 
 exec_(Prog,Pc,A,X,P,M) ->
     #bpf_insn{code=Code,k=K} = I = element(Pc,Prog),
-    io:format("~w: ~p, A=~w,X=~w,M=~w\n", [Pc, I,A,X,M]),
+    ?debug("~w: ~p, A=~w,X=~w,M=~w\n", [Pc, I,A,X,M]),
     Pc1 = Pc+1,
     case Code of
 	ldaw -> exec_(Prog, Pc1, ld_(P,K,32), X, P, M);
@@ -1542,93 +2141,17 @@ jump_(Prog, Pc, true, I, A, X, P, M) ->
 jump_(Prog, Pc, false, I, A, X, P, M) ->
     exec_(Prog, Pc+I#bpf_insn.jf, A, X, P, M).
 
+
 ld_(P,K,Size) ->
     case P of
 	<<_:K/binary, LDV:Size, _/binary>> ->
 	    LDV;
 	_ ->
-	    io:format("packet offset ~w:~w out of bounds, len=~w\n", 
-		      [(K),(Size),byte_size((P))]),
+	    ?error("packet offset ~w:~w out of bounds, len=~w\n", 
+		   [(K),(Size),byte_size((P))]),
 	    throw(packet_index)
     end.
 
-%%
-%% Examples (remove soon)
-%%
--define(ETHERTYPE_IP,     16#0800).
--define(ETHERTYPE_IPV6,   16#86dd).
--define(ETHERTYPE_ARP,    16#0806).
--define(ETHERTYPE_REVARP, 16#8035).
-
--define(ARPOP_REQUEST,  1).	%% ARP request.
--define(ARPOP_REPLY,    2).	%% ARP reply.
--define(ARPOP_RREQUEST, 3).	%% RARP request.
--define(ARPOP_RREPLY,   4).     %% RARP reply.
-
--define(IPPROTO_TCP,  6).
--define(IPPROTO_ICMP,  1).
--define(IPPROTO_UDP,  17).
-
--define(OFFS_ETH_DST,    (0)).
--define(OFFS_ETH_SRC,    (6)).
--define(OFFS_ETH_TYPE,   (6+6)).
--define(OFFS_ETH_DATA,   (6+6+2)).
-
--define(OFFS_ARP_HTYPE,  (?OFFS_ETH_DATA)).
--define(OFFS_ARP_PTYPE,  (?OFFS_ETH_DATA+2)).
--define(OFFS_ARP_HALEN,  (?OFFS_ETH_DATA+4)).
--define(OFFS_ARP_PALEN,  (?OFFS_ETH_DATA+5)).
--define(OFFS_ARP_OP,     (?OFFS_ETH_DATA+6)).
-
--define(OFFS_IPV4_HLEN,  (?OFFS_ETH_DATA+0)).
--define(OFFS_IPV4_DSRV,  (?OFFS_ETH_DATA+1)).
--define(OFFS_IPV4_LEN,   (?OFFS_ETH_DATA+2)).
--define(OFFS_IPV4_ID,    (?OFFS_ETH_DATA+4)).
--define(OFFS_IPV4_FRAG,  (?OFFS_ETH_DATA+6)).
--define(OFFS_IPV4_TTL,   (?OFFS_ETH_DATA+8)).
--define(OFFS_IPV4_PROTO, (?OFFS_ETH_DATA+9)).
--define(OFFS_IPV4_CSUM,  (?OFFS_ETH_DATA+10)).
--define(OFFS_IPV4_SRC,   (?OFFS_ETH_DATA+12)).
--define(OFFS_IPV4_DST,   (?OFFS_ETH_DATA+16)).
--define(OFFS_IPV4_DATA,  (?OFFS_ETH_DATA+20)).
-
--define(OFFS_IPV6_LEN,  (?OFFS_ETH_DATA+4)).
--define(OFFS_IPV6_NEXT, (?OFFS_ETH_DATA+6)).
--define(OFFS_IPV6_HOPC, (?OFFS_ETH_DATA+7)).
--define(OFFS_IPV6_SRC,  (?OFFS_ETH_DATA+8)).
--define(OFFS_IPV6_DST,  (?OFFS_ETH_DATA+24)).
--define(OFFS_IPV6_PAYLOAD, (?OFFS_ETH_DATA+40)).
-
-%% Given that X contains the IP headers length
--define(OFFS_TCP_SRC_PORT, 0).   %% uint16
--define(OFFS_TCP_DST_PORT, 2). %% uint16
--define(OFFS_TCP_SEQ,      4). %% uint32
--define(OFFS_TCP_ACK,      8). %% uint32
--define(OFFS_TCP_FLAGS,    12). %% Offs:4,_:6,UAPRSF:6
--define(OFFS_TCP_WINDOW,   14). %% uint16
--define(OFFS_TCP_CSUM,     16). %% uint16
--define(OFFS_TCP_UPTR,     18). %% uint16
-
--define(XOFFS_TCP_SRC_PORT, (?OFFS_ETH_DATA+?OFFS_TCP_SRC_PORT)).
--define(XOFFS_TCP_DST_PORT, (?OFFS_ETH_DATA+?OFFS_TCP_DST_PORT)).
--define(XOFFS_TCP_SEQ,      (?OFFS_ETH_DATA+?OFFS_TCP_SEQ)).
--define(XOFFS_TCP_ACK,      (?OFFS_ETH_DATA+?OFFS_TCP_ACK)).
--define(XOFFS_TCP_FLAGS,    (?OFFS_ETH_DATA+?OFFS_TCP_FLAGS)).
--define(XOFFS_TCP_WINDOW,   (?OFFS_ETH_DATA+?OFFS_TCP_WINDOW)).
--define(XOFFS_TCP_CSUM,     (?OFFS_ETH_DATA+?OFFS_TCP_CSUM)).
--define(XOFFS_TCP_UPTR,     (?OFFS_ETH_DATA+?OFFS_TCP_UPTR)).
-
--define(OFFS_UDP_SRC_PORT,  0).  %% uint16
--define(OFFS_UDP_DST_PORT,  2).  %% uint16
--define(OFFS_UDP_LENGTH,    4).  %% uint16
--define(OFFS_UDP_CSUM,      6).  %% uint16
--define(OFFS_UDP_DATA,      8).  
-
--define(XOFFS_UDP_SRC_PORT, ?OFFS_ETH_DATA+?OFFS_UDP_SRC_PORT).
--define(XOFFS_UDP_DST_PORT, ?OFFS_ETH_DATA+?OFFS_UDP_DST_PORT).
--define(XOFFS_UDP_LENGTH,   ?OFFS_ETH_DATA+?OFFS_UDP_LENGTH).
--define(XOFFS_UDP_CSUM,     ?OFFS_ETH_DATA+?OFFS_UDP_CSUM).
--define(XOFFS_UDP_DATA,     ?OFFS_ETH_DATA+?OFFS_UDP_DATA).
 
 %% (nested) list of code, default to reject
 build_program(Code) when is_list(Code) ->
@@ -1642,11 +2165,31 @@ build_programa(Code) when is_list(Code) ->
 
 %% build expression, A>0 => accept, A=0 => reject
 build_programx(Expr) ->
-    X = expr(Expr),
+    X = expr(Expr, 0),
     Prog = list_to_tuple(lists:flatten([X,
-					if_gtk(0, [accept()], [reject()]),
+					#bpf_insn { code=jgtk, k=0,
+						    jt=0, jf=1 },
+					accept(),
 					reject()])),
     build_(Prog).
+
+%% build expression list return the number of the expression
+%% that match or 0 if no match
+build_program_list(ExprList) ->
+    Prog = lists:flatten(make_program_list(ExprList,0,1)),
+    build_(list_to_tuple(Prog)).
+
+make_program_list([Expr],Offs,I) ->
+    [expr(Expr,Offs),
+     #bpf_insn { code=jgtk, k=0, jt=0, jf=1 },
+     return(I),
+     reject()];
+make_program_list([Expr|ExprList],Offs,I) ->
+    Prog1 = make_program_list(ExprList,Offs,I+1),
+    [expr(Expr,Offs),
+     #bpf_insn { code=jgtk, k=0, jt=0, jf=1 },
+     return(I),
+     Prog1].
 
 
 build_(Prog0) ->
@@ -1668,19 +2211,6 @@ build_(Prog0) ->
 	    end
     end.
 
-
-prog_if_ipv4(True,False) ->
-    if_ethertype(?ETHERTYPE_IP, True, False).
-
-prog_if_ipv6(True,False) ->
-    if_ethertype(?ETHERTYPE_IPV6, True, False).
-
-prog_if_rarp(True,False) ->
-    if_ethertype(?ETHERTYPE_REVARP, True, False).
-
-prog_if_arp(True,False) ->
-    if_ethertype(?ETHERTYPE_ARP, True, False).
-
 accept() ->
     #bpf_insn{code=retk, k=?uint32(-1) }.
 
@@ -1700,84 +2230,213 @@ nop() ->
 %% calculate the expression into accumulator
 %% use memory as a stack, then optimise stack use
 
-expr(Expr) ->
-    {_Sp,X} = expr(Expr, ?BPF_MEMWORDS),
+expr(Expr) -> expr(Expr, 0).
+    
+expr(Expr,Offs) ->
+    {_Sp,X} = expr_(Expr,Offs,?BPF_MEMWORDS),
     X.
 
-expr(A, Sp) when is_atom(A) -> aexpr(A,Sp);
-expr(K, Sp) when is_integer(K) -> iexpr(K,Sp);
-expr({p,K,4},Sp)    -> pexpr(ldaw,K,Sp);
-expr({p,K,2},Sp)    -> pexpr(ldah,K,Sp);
-expr({p,K,1},Sp)    -> pexpr(ldab,K,Sp);
-expr({p,0,K,4},Sp)  -> pexpr(ldaw,K,Sp);
-expr({p,0,K,2},Sp)  -> pexpr(ldah,K,Sp);
-expr({p,0,K,1},Sp)  -> pexpr(ldab,K,Sp);
-expr({p,X,K,4},Sp)  -> pexpr(ldiw,X,K,Sp);
-expr({p,X,K,2},Sp)  -> pexpr(ldih,X,K,Sp);
-expr({p,X,K,1},Sp)  -> pexpr(ldib,X,K,Sp);
+expr_(Attr,Offs,Sp) when is_atom(Attr) -> attr(atom_to_list(Attr),Offs,Sp);
+expr_(Attr,Offs,Sp) when is_list(Attr) -> attr(Attr,Offs,Sp);
+expr_(K,_Offs,Sp) when is_integer(K) -> iexpr(K,0,Sp);
+expr_({p,K,4},Offs,Sp)    -> pexpr(ldaw,K,Offs,Sp);
+expr_({p,K,2},Offs,Sp)    -> pexpr(ldah,K,Offs,Sp);
+expr_({p,K,1},Offs,Sp)    -> pexpr(ldab,K,Offs,Sp);
+expr_({p,0,K,4},Offs,Sp)  -> pexpr(ldaw,K,Offs,Sp);
+expr_({p,0,K,2},Offs,Sp)  -> pexpr(ldah,K,Offs,Sp);
+expr_({p,0,K,1},Offs,Sp)  -> pexpr(ldab,K,Offs,Sp);
+expr_({p,X,K,4},Offs,Sp)  -> pexpr(ldiw,X,K,Offs,Sp);
+expr_({p,X,K,2},Offs,Sp)  -> pexpr(ldih,X,K,Offs,Sp);
+expr_({p,X,K,1},Offs,Sp)  -> pexpr(ldib,X,K,Offs,Sp);
 
-expr({'+',Ax,Bx},Sp) -> bop(addx,Ax,Bx,Sp);
-expr({'-',Ax,Bx},Sp) -> bop(subx,Ax,Bx,Sp);
-expr({'*',Ax,Bx},Sp) -> bop(mulx,Ax,Bx,Sp);
-expr({'/',Ax,Bx},Sp) -> bop(divx,Ax,Bx,Sp);
-expr({'&',Ax,Bx},Sp) -> bop(andx,Ax,Bx,Sp);
-expr({'|',Ax,Bx},Sp) -> bop(orx,Ax,Bx,Sp);
-expr({'<<',Ax,Bx},Sp) -> bop(lshx,Ax,Bx,Sp);
-expr({'>>',Ax,Bx},Sp) -> bop(rshx,Ax,Bx,Sp);
-expr({'-',Ax}, Sp)    -> uop(neg, Ax, Sp);
-expr({'>',Ax,Bx},Sp)  -> rop(jgtx,Ax,Bx,Sp);
-expr({'>=',Ax,Bx},Sp) -> rop(jgex,Ax,Bx,Sp);
-expr({'==',Ax,Bx},Sp) -> rop(jeqx,Ax,Bx,Sp);
-expr({'<',Ax,Bx},Sp)  -> rop(jgtx,Bx,Ax,Sp);
-expr({'<=',Ax,Bx},Sp) -> rop(jgex,Bx,Ax,Sp);
-expr({'!=',Ax,Bx},Sp) -> lbool({'-',Ax,Bx},Sp);
-expr({'!',Ax},Sp)     -> lnot(Ax,Sp);
-expr({'&&',Ax,Bx},Sp) -> land(Ax,Bx,Sp);
-expr({'&&',[]},Sp)    -> expr(true,Sp);
-expr({'&&',As},Sp) when is_list(As) -> expr(expr_list('&&',As), Sp);
-expr({'||',Ax,Bx},Sp) -> lor(Ax,Bx,Sp);
-expr({'||',[]},Sp)    -> expr(false,Sp);
-expr({'||',As},Sp) when is_list(As) -> expr(expr_list('||',As), Sp);
-expr({'memeq',Ax,Data},Sp) when is_binary(Data) ->
+expr_({'+',Ax,Bx},Offs,Sp) -> bop(addx,Ax,Bx,Offs,Sp);
+expr_({'+',[]},Offs,Sp)    -> expr_(0,Offs,Sp);
+expr_({'+',As},Offs,Sp) when is_list(As) -> 
+    expr_(expr_rs('+',lists:reverse(As)),Offs,Sp);
+
+expr_({'-',Ax,Bx},Offs,Sp) -> bop(subx,Ax,Bx,Offs,Sp);
+expr_({'*',Ax,Bx},Offs,Sp) -> bop(mulx,Ax,Bx,Offs,Sp);
+expr_({'/',Ax,Bx},Offs,Sp) -> bop(divx,Ax,Bx,Offs,Sp);
+expr_({'&',Ax,Bx},Offs,Sp) -> bop(andx,Ax,Bx,Offs,Sp);
+expr_({'|',Ax,Bx},Offs,Sp) -> bop(orx,Ax,Bx,Offs,Sp);
+expr_({'<<',Ax,Bx},Offs,Sp) -> bop(lshx,Ax,Bx,Offs,Sp);
+expr_({'>>',Ax,Bx},Offs,Sp) -> bop(rshx,Ax,Bx,Offs,Sp);
+expr_({'-',Ax},Offs,Sp)    -> uop(neg,Ax,Offs,Sp);
+expr_({'>',Ax,Bx},Offs,Sp)  -> rop(jgtx,Ax,Bx,Offs,Sp);
+expr_({'>=',Ax,Bx},Offs,Sp) -> rop(jgex,Ax,Bx,Offs,Sp);
+expr_({'==',Ax,Bx},Offs,Sp) -> rop(jeqx,Ax,Bx,Offs,Sp);
+expr_({'<',Ax,Bx},Offs,Sp)  -> rop(jgtx,Bx,Ax,Offs,Sp);
+expr_({'<=',Ax,Bx},Offs,Sp) -> rop(jgex,Bx,Ax,Offs,Sp);
+expr_({'!=',Ax,Bx},Offs,Sp) -> lbool({'-',Ax,Bx},Offs,Sp);
+expr_({'!',Ax},Offs,Sp)     -> lnot(Ax,Offs,Sp);
+expr_({'&&',Ax,Bx},Offs,Sp) -> land(Ax,Bx,Offs,Sp);
+expr_({'&&',[]},Offs,Sp)    -> expr_(true,Offs,Sp);
+expr_({'&&',As},Offs,Sp) when is_list(As) -> expr_(expr_rs('&&',As),Offs,Sp);
+
+expr_({'||',Ax,Bx},Offs,Sp) -> lor(Ax,Bx,Offs,Sp);
+expr_({'||',[]},Offs,Sp)    -> expr_(false,Offs,Sp);
+expr_({'||',As},Offs,Sp) when is_list(As) -> expr_(expr_rs('||',As),Offs,Sp);
+
+expr_({'memeq',Ax,Data},Offs,Sp) when is_binary(Data) ->
+    expr_memeq(Ax, Data, Offs, Sp);
+expr_({'memeq',Ax,Mask,Data},Offs,Sp) when is_binary(Data) ->
+    expr_memeq(Ax, Mask, Data, Offs, Sp);
+expr_({'memge',Ax,Data},Offs,Sp) when is_binary(Data) ->
+    expr_memge(Ax, Data, Offs, Sp);
+expr_({'memle',Ax,Data},Offs,Sp) when is_binary(Data) ->
+    expr_memle(Ax, Data, Offs, Sp).
+
+expr_memeq(Ax,Data,Offs,Sp) ->
     %% Ax is an index expression
-    {Sp1,Ac} = expr(Ax,Sp),
+    {Sp1,Ac} = expr_(Ax,Offs,Sp),
     %% Move A to X
-    Jf = 2*((byte_size(Data)+3) div 4),  %% number of instructions
+    J = 2*((byte_size(Data)+3) div 4),  %% number of instructions (memeq)
     {Sp1,
      [ Ac,    %% A = index
        #bpf_insn { code=tax },          %% X=A index register
-       expr_memcmp(Data, 0, Jf),        %% Compare bytes P[X+0...X+N-1]
+       memeq(Data, 0, J),               %% Compare bytes P[X+0...X+N-1]
        #bpf_insn { code=ldc, k=1 },     %% Jt: A=1
        #bpf_insn { code=jmp, k=1 },     %% skip
        #bpf_insn { code=ldc, k=0 },     %% Jf: A=0
        #bpf_insn { code=sta, k=Sp1 }    %% Store bool value
-     ]}.  
+     ]}.
 
-%% compare 
-expr_memcmp(<<X:32,Rest/binary>>, I, Jf) ->
+%% memeq with mask
+expr_memeq(Ax,Mask,Data,Offs,Sp) ->
+    {Sp1,Ac} = expr_(Ax,Offs,Sp),
+    %% Move A to X
+    J = 3*((byte_size(Data)+3) div 4),  %% number of instructions in memeq
+    {Sp1,
+     [ Ac,    %% A = index
+       #bpf_insn { code=tax },          %% X=A index register
+       memeq(Data, Mask, 0, J-1),       %% Compare bytes P[X+0...X+N-1]
+       #bpf_insn { code=ldc, k=1 },     %% Jt: A=1
+       #bpf_insn { code=jmp, k=1 },     %% skip
+       #bpf_insn { code=ldc, k=0 },     %% Jf: A=0
+       #bpf_insn { code=sta, k=Sp1 }    %% Store bool value
+     ]}.
+
+expr_memge(Ax,Data,Offs,Sp) ->    
+    %% Ax is an index expression
+    {Sp1,Ac} = expr_(Ax,Offs,Sp),
+    %% Move A to X
+    J = 3*((byte_size(Data)+3) div 4),  %% number of instructions (memge)
+    {Sp1,
+     [ Ac,    %% A = index
+       #bpf_insn { code=tax },          %% X=A index register
+       memge(Data, 0, J-3, J-1),        %% Compare bytes P[X+0...X+N-1]
+       #bpf_insn { code=ldc, k=1 },     %% Jt: A=1
+       #bpf_insn { code=jmp, k=1 },     %% skip
+       #bpf_insn { code=ldc, k=0 },     %% Jf: A=0
+       #bpf_insn { code=sta, k=Sp1 }    %% Store bool value
+     ]}.
+
+expr_memle(Ax,Data,Offs,Sp) ->    
+    %% Ax is an index expression
+    {Sp1,Ac} = expr_(Ax,Offs,Sp),
+    %% Move A to X
+    J = 3*((byte_size(Data)+3) div 4),  %% number of instructions (memge)
+    {Sp1,
+     [ Ac,    %% A = index
+       #bpf_insn { code=tax },          %% X=A index register
+       memle(Data, 0, J-3, J-1),        %% Compare bytes P[X+0...X+N-1]
+       #bpf_insn { code=ldc, k=1 },     %% Jt: A=1
+       #bpf_insn { code=jmp, k=1 },     %% skip
+       #bpf_insn { code=ldc, k=0 },     %% Jf: A=0
+       #bpf_insn { code=sta, k=Sp1 }    %% Store bool value
+     ]}.
+
+%% compare binary data Bin[i] == P[x+i]
+memeq(<<X:32,Rest/binary>>, I, Jf) ->
     [ #bpf_insn { code=ldiw, k=I },
       #bpf_insn { code=jeqk, k=X, jt=0, jf=Jf } |
-      expr_memcmp(Rest, I+4, Jf-2)];
-expr_memcmp(<<X:16,Rest/binary>>, I, Jf) ->
+      memeq(Rest, I+4, Jf-2)];
+memeq(<<X:16,Rest/binary>>, I, Jf) ->
     [ #bpf_insn { code=ldih, k=I },
       #bpf_insn { code=jeqk, k=X, jt=0, jf=Jf } |
-      expr_memcmp(Rest, I+2, Jf-2)];
-expr_memcmp(<<X:8>>, I, Jf) ->
+      memeq(Rest, I+2, Jf-2)];
+memeq(<<X:8>>, I, Jf) ->
     [ #bpf_insn { code=ldib, k=I },
       #bpf_insn { code=jeqk, k=X, jt=0, jf=Jf }];
-expr_memcmp(<<>>, _I, _Jf) ->
+memeq(<<>>, _I, _Jf) ->
+    [].
+
+%% memeq with mask: Bin[i] = P[x+i] & Mask[i]
+memeq(<<X:32,Bin/binary>>,<<M:32,Mask/binary>>, I, Jf) ->
+    [ #bpf_insn { code=ldiw, k=I },
+      #bpf_insn { code=andk, k=M },
+      #bpf_insn { code=jeqk, k=X, jt=0, jf=Jf } |
+      memeq(Bin, Mask, I+4, Jf-3)];
+memeq(<<X:16,Bin/binary>>,<<M:16,Mask/binary>>, I, Jf) ->
+    [ #bpf_insn { code=ldih, k=I },
+      #bpf_insn { code=andk, k=M },
+      #bpf_insn { code=jeqk, k=X, jt=0, jf=Jf } |
+      memeq(Bin, Mask, I+2, Jf-3)];
+memeq(<<X:8>>,<<M:8>>, I, Jf) ->
+    [ #bpf_insn { code=ldib, k=I },
+      #bpf_insn { code=andk, k=M },
+      #bpf_insn { code=jeqk, k=X, jt=0, jf=Jf }];
+memeq(<<>>, <<>>, _I, _Jf) ->
+    [].
+
+%% compare binary data Bin[i] >= P[x+i]
+memge(<<X:32,Rest/binary>>, I, Jt, Jf) ->
+    [ #bpf_insn { code=ldiw, k=I },
+      #bpf_insn { code=jgtk, k=X, jt=Jt+1, jf=0 },
+      #bpf_insn { code=jeqk, k=X, jt=0,  jf=Jf } |
+      memge(Rest, I+4, Jt-3, Jf-3)];
+memge(<<X:16,Rest/binary>>, I, Jt, Jf) ->
+    [ #bpf_insn { code=ldih, k=I },
+      #bpf_insn { code=jgtk, k=X, jt=Jt+1, jf=0 },
+      #bpf_insn { code=jeqk, k=X, jt=0, jf=Jf } |
+      memge(Rest, I+2, Jt-3, Jf-3)];
+memge(<<X:8>>, I, Jt, Jf) ->
+    [ #bpf_insn { code=ldib, k=I },
+      #bpf_insn { code=jgtk, k=X, jt=Jt+1, jf=0 },
+      #bpf_insn { code=jeqk, k=X, jt=0, jf=Jf }];
+memge(<<>>, _I, _Jt, _Jf) ->
+    [].
+
+%% compare binary data Bin[i] <= P[x+i]
+memle(<<X:32,Rest/binary>>, I, Jt, Jf) ->
+    [ #bpf_insn { code=ldiw, k=I },
+      #bpf_insn { code=jgek, k=X, jt=0, jf=Jt+1 }, %% jlt!!
+      #bpf_insn { code=jeqk, k=X, jt=0, jf=Jf } |
+      memle(Rest, I+4, Jt-3, Jf-3)];
+memle(<<X:16,Rest/binary>>, I, Jt, Jf) ->
+    [ #bpf_insn { code=ldih, k=I },
+      #bpf_insn { code=jgek, k=X, jt=0, jf=Jt+1 }, %% jlt!!
+      #bpf_insn { code=jeqk, k=X, jt=0, jf=Jf } |
+      memle(Rest, I+2, Jt-3, Jf-3)];
+memle(<<X:8>>, I, Jt, Jf) ->
+    [ #bpf_insn { code=ldib, k=I },
+      #bpf_insn { code=jgek, k=X, jt=0, jf=Jt+1 }, %% jlt!!
+      #bpf_insn { code=jeqk, k=X, jt=0, jf=Jf }];
+memle(<<>>, _I, _Jt, _Jf) ->
     [].
 
 
-expr_list(_Op, [A]) -> A;
-expr_list(Op, [A|As]) -> {Op, A, expr_list(Op,As)}.
+
+expr_rs(_Op,[A]) -> A;
+expr_rs(Op,[A|As]) -> {Op,A,expr_rs(Op,As)}.
+
+expr_ls(Op, [A|As]) -> expr_ls(Op, As, A).
+
+expr_ls(_Op, [], A) -> A;
+expr_ls(Op, [B|As], A) -> expr_ls(Op, As, {Op,A,B}).
+
     
 %% test if "true" == (jgtk > 0)
 
 %% Ax && Bx
-land(Ax,Bx,Sp0) ->
-    {Sp1,Ac} = expr(Ax, Sp0),
-    {Sp1,Bc} = expr(Bx, Sp0),
+land("vlan",Bx,Offs,Sp0) ->
+    land("eth.type.vlan", Bx, Offs, Offs+?VLAN,Sp0);
+land(Ax,Bx,Offs,Sp0) ->
+    land(Ax,Bx,Offs,Offs,Sp0).
+
+land(Ax,Bx,OffsA,OffsB,Sp0) ->
+    {Sp1,Ac} = expr_(Ax,OffsA,Sp0),
+    {Sp1,Bc} = expr_(Bx,OffsB,Sp0),
     LBc = code_length(Bc),
     {Sp1,
      [Ac,
@@ -1792,9 +2451,9 @@ land(Ax,Bx,Sp0) ->
       #bpf_insn { code=sta, k=Sp1 }]}.
 
 %% Ax || Bx
-lor(Ax,Bx,Sp0) ->
-    {Sp1,Ac} = expr(Ax, Sp0),
-    {Sp1,Bc} = expr(Bx, Sp0),
+lor(Ax,Bx,Offs,Sp0) ->
+    {Sp1,Ac} = expr_(Ax,Offs,Sp0),
+    {Sp1,Bc} = expr_(Bx,Offs,Sp0),
     LBc = code_length(Bc),
     {Sp1,
      [Ac,
@@ -1809,8 +2468,8 @@ lor(Ax,Bx,Sp0) ->
       #bpf_insn { code=sta, k=Sp1 }]}.
 
 %% !Ax
-lnot(Ax, Sp0) ->
-    {Sp1,Ac} = expr(Ax, Sp0),
+lnot(Ax,Offs,Sp0) ->
+    {Sp1,Ac} = expr_(Ax,Offs,Sp0),
     {Sp1, [Ac,
 	   #bpf_insn { code=lda, k=Sp1 },     %% A = exp(Ax)
 	   #bpf_insn { code=jgtk, k=0, jt=0, jf=2 },
@@ -1820,8 +2479,8 @@ lnot(Ax, Sp0) ->
 	   #bpf_insn { code=sta, k=Sp1 }]}.
 
 %% !!Ax convert integer to boolean
-lbool(Ax,Sp0) ->
-    {Sp1,Ac} = expr(Ax, Sp0),
+lbool(Ax,Offs,Sp0) ->
+    {Sp1,Ac} = expr_(Ax,Offs,Sp0),
     {Sp1, [Ac,
 	   #bpf_insn { code=lda, k=Sp1 },     %% A = exp(Ax)
 	   #bpf_insn { code=jgtk, k=0, jt=0, jf=2 },
@@ -1830,9 +2489,9 @@ lbool(Ax,Sp0) ->
 	   #bpf_insn { code=ldc, k=0 },        %% A=false
 	   #bpf_insn { code=sta, k=Sp1 }]}.
 
-rop(Jop, Ax, Bx, Sp0) ->
-    {Sp1,Bc} = expr(Bx, Sp0),
-    {Sp2,Ac} = expr(Ax, Sp1),
+rop(Jop,Ax,Bx,Offs,Sp0) ->
+    {Sp1,Bc} = expr_(Bx,Offs,Sp0),
+    {Sp2,Ac} = expr_(Ax,Offs,Sp1),
     {Sp1, [Bc,Ac,
 	   #bpf_insn { code=ldx, k=Sp1 },  %% X = exp(Bx)
 	   #bpf_insn { code=lda, k=Sp2 },  %% A = exp(Ax)
@@ -1842,180 +2501,365 @@ rop(Jop, Ax, Bx, Sp0) ->
 	   #bpf_insn { code=ldc, k=0 },        %% true value A=0
 	   #bpf_insn { code=sta, k=Sp1 }]}.
 
-bop(Bop, Ax, Bx, Sp0) ->
-    {Sp1,Bc} = expr(Bx, Sp0),
-    {Sp2,Ac} = expr(Ax, Sp1),
+bop(Bop,Ax,Bx,Offs,Sp0) ->
+    {Sp1,Bc} = expr_(Bx,Offs,Sp0),
+    {Sp2,Ac} = expr_(Ax,Offs,Sp1),
     {Sp1, [Bc,Ac,
 	   #bpf_insn { code=ldx, k=Sp1 },  %% X = exp(Bx)
 	   #bpf_insn { code=lda, k=Sp2 },  %% A = exp(Ax)
 	   #bpf_insn { code=Bop },        %% A = A <bop> X
 	   #bpf_insn { code=sta, k=Sp1 }]}.
 
-uop(Uop, Ax, Sp0) ->
-    {Sp1,Ac} = expr(Ax, Sp0),
+uop(Uop,Ax,Offs,Sp0) ->
+    {Sp1,Ac} = expr_(Ax,Offs,Sp0),
     {Sp1, [Ac,
 	   #bpf_insn { code=lda, k=Sp1 },  %% A = exp(Ax)
 	   #bpf_insn { code=Uop },         %% A = <uop> A
 	   #bpf_insn { code=sta, k=Sp1 }]}.
 
-iexpr(K,Sp0) when is_integer(K) ->
+iexpr(K,Offs,Sp0) when is_integer(K) ->
     Sp1 = Sp0-1,
-    {Sp1, [#bpf_insn {code=ldc, k=K},
+    {Sp1, [#bpf_insn {code=ldc, k=K+Offs},
 	   #bpf_insn {code=sta, k=Sp1}]}.
 
-%% atom expression
-aexpr(A, Sp0) ->
-    case A of
-	false        -> iexpr(0, Sp0);
-	true         -> iexpr(1, Sp0);
-	'tcp'        -> iexpr(?IPPROTO_TCP,Sp0);
-	'udp'        -> iexpr(?IPPROTO_UDP,Sp0);
-	'icmp'       -> iexpr(?IPPROTO_ICMP,Sp0);
-	'ipv4'       -> iexpr(?ETHERTYPE_IP,Sp0);
-	'ipv6'       -> iexpr(?ETHERTYPE_IPV6,Sp0);
-	'arp'        -> iexpr(?ETHERTYPE_ARP,Sp0);
-	'revarp'     -> iexpr(?ETHERTYPE_REVARP,Sp0);
-
+%% attribute expression
+attr(Attr,Offs,Sp) ->
+    case Attr of
 	%% ethernet
-	'eth.type'   -> expr({p,?OFFS_ETH_TYPE,2},Sp0);
-	'eth.type.ipv4' -> expr({'==','eth.type', 'ipv4'},Sp0);
-	'eth.type.ipv6' -> expr({'==','eth.type', 'ipv6'},Sp0);
-	'eth.type.arp'  -> expr({'==','eth.type', 'arp'},Sp0);
-	'eth.type.revarp' -> expr({'==','eth.type', 'revarp'},Sp0);
-	'eth.data'        -> iexpr(?OFFS_ETH_DATA,Sp0); %% (offset)
-	    
+	"eth["++Elem      -> vexpr_(Elem, ?OFFS_ETH, Offs, Sp);
+	"eth.type"        -> expr_({p,?OFFS_ETH_TYPE,2},Offs,Sp);
+	"eth.type."++Type -> eth_type(Type, Offs, Sp);
+	"eth.data"        -> iexpr(?OFFS_ETH_DATA,Offs,Sp);
+	"eth.data["++Elem -> vexpr_(Elem, ?OFFS_ETH_DATA, Offs, Sp);
+
+	%% vlan
+	"vlan.tpid" -> expr_({p,?OFFS_VLAN_TPID,2},Offs,Sp);
+	"vlan.tci"  -> expr_({p,?OFFS_VLAN_TCI,2},Offs,Sp);
+	"vlan.pcp"  -> expr_({'&',{'>>',{p,?OFFS_VLAN_TCI,2},13},7},Offs,Sp);
+	"vlan.dei"  -> expr_({'&',{'>>',{p,?OFFS_VLAN_TCI,2},12},1},Offs,Sp);
+	"vlan.vid"  -> expr_({'&',{p,?OFFS_VLAN_TCI,2}, 16#fff},Offs,Sp);
+	"vlan."++Num when hd(Num)>=$0,hd(Num)=<$9 ->
+	    expr_({'==', "vlan.vid", list_to_integer(Num)}, Offs, Sp);
+
 	%% arp
-	'arp.htype'   -> expr({p,?OFFS_ARP_HTYPE,2},Sp0);
-	'arp.ptype'   -> expr({p,?OFFS_ARP_PTYPE,2},Sp0);
-	'arp.halen'   -> expr({p,?OFFS_ARP_HALEN,1},Sp0);
-	'arp.palen'   -> expr({p,?OFFS_ARP_PALEN,1},Sp0);
-	'arp.op'      -> expr({p,?OFFS_ARP_OP,2},Sp0);
+	"arp.htype"   -> expr_({p,?OFFS_ARP_HTYPE,2},Offs,Sp);
+	"arp.ptype"   -> expr_({p,?OFFS_ARP_PTYPE,2},Offs,Sp);
+	"arp.halen"   -> expr_({p,?OFFS_ARP_HALEN,1},Offs,Sp);
+	"arp.palen"   -> expr_({p,?OFFS_ARP_PALEN,1},Offs,Sp);
+	"arp.op"      -> expr_({p,?OFFS_ARP_OP,2},Offs,Sp);
 
-	%% ipv4
-	'ipv4.hlen'   -> pexpr(txa,{msh,?OFFS_IPV4_HLEN},0,Sp0);
-	'ipv4.diffsrv'  -> expr({p,?OFFS_IPV4_DSRV,1},Sp0);
-	'ipv4.len'      -> expr({p,?OFFS_IPV4_LEN,2},Sp0);
-	'ipv4.id'       -> expr({p,?OFFS_IPV4_ID,2},Sp0);
-	'ipv4.flag.df'  -> expr({'&',{'>>',{p,?OFFS_IPV4_FRAG,2},14},16#1},Sp0);
-	'ipv4.flag.mf' -> expr({'&',{'>>',{p,?OFFS_IPV4_FRAG,2}, 13},16#1},Sp0);
-	'ipv4.frag' ->  expr({'&',{p,?OFFS_IPV4_FRAG,2},16#1FFF},Sp0);
-	'ipv4.ttl'   -> expr({p,?OFFS_IPV4_TTL,2},Sp0);
-	'ipv4.proto' -> expr({p,?OFFS_IPV4_PROTO,1},Sp0);
-	'ipv4.proto.tcp' -> expr({'==','ipv4.proto','tcp'},Sp0);
-	'ipv4.proto.udp' -> expr({'==','ipv4.proto','udp'},Sp0);
-	'ipv4.proto.icmp' -> expr({'==','ipv4.proto','icmp'},Sp0);
-	'ipv4.dst'   -> expr({p,?OFFS_IPV4_DST,4},Sp0);
-	'ipv4.src'   -> expr({p,?OFFS_IPV4_SRC,4},Sp0);
-	'ipv4.options' -> iexpr(?OFFS_IPV4_DATA, Sp0); %% (offset)
-	'ipv4.data'  -> expr({'+','eth.data','ipv4.hlen'}, Sp0);  %% (offset)
+	"port."++PortStr -> %% currently ip/ipv6 other?
+	    expr_({'||',
+		   [{'&&',["eth.type.ip","ip.port."++PortStr]},
+		    {'&&',["eth.type.ip6","ip6.port."++PortStr]}
+		   ]}, Offs, Sp);
 
-	%% ipv6
-	'ipv6.len'   -> expr({p,?OFFS_IPV6_LEN,2},Sp0);
-	'ipv6.next'  -> expr({p,?OFFS_IPV6_NEXT,1},Sp0);
-	'ipv4.next.tcp' -> expr({'==','ipv6.next','tcp'},Sp0);
-	'ipv4.next.udp' -> expr({'==','ipv6.next','udp'},Sp0);
-	'ipv6.hopc'  -> expr({p,?OFFS_IPV6_HOPC,1},Sp0);
-	'ipv6.payload' -> iexpr(?OFFS_IPV6_PAYLOAD, Sp0);
+	%% ip
+	"ip["++Elem  -> vexpr_(Elem, ?OFFS_IPV4, Offs, Sp);
+	"ip.hlen"    -> pexpr(txa,{msh,?OFFS_IPV4_HLEN},0,Offs,Sp);
+	"ip.diffsrv" -> expr_({p,?OFFS_IPV4_DSRV,1},Offs,Sp);
+	"ip.len"     -> expr_({p,?OFFS_IPV4_LEN,2},Offs,Sp);
+	"ip.id"      -> expr_({p,?OFFS_IPV4_ID,2},Offs,Sp);
+	"ip.flag.df" -> expr_({'&',{'>>',{p,?OFFS_IPV4_FRAG,2},14},16#1},Offs,Sp);
+	"ip.flag.mf" -> expr_({'&',{'>>',{p,?OFFS_IPV4_FRAG,2}, 13},16#1},Offs,Sp);
+	"ip.frag" -> expr_({'&',{p,?OFFS_IPV4_FRAG,2},16#1FFF},Offs,Sp);
+	"ip.ttl" -> expr_({p,?OFFS_IPV4_TTL,2},Offs,Sp);
+	"ip.proto" -> expr_({p,?OFFS_IPV4_PROTO,1},Offs,Sp);
+	"ip.proto."++Name -> ipv4_proto(Name,Offs,Sp);
 
-	%% tcp/ipv4
-	'ipv4.tcp' -> expr('ipv4.data', Sp0); %% (offset)
-	'ipv4.tcp.dst_port' ->
-	    expr({p,{msh,?OFFS_IPV4_HLEN},?XOFFS_TCP_DST_PORT,2},Sp0);
-	'ipv4.tcp.src_port' -> 
-	    expr({p,{msh,?OFFS_IPV4_HLEN},?XOFFS_TCP_SRC_PORT,2},Sp0);
-	'ipv4.tcp.seq' ->
-	    expr({p,{msh,?OFFS_IPV4_HLEN},?XOFFS_TCP_SEQ,4},Sp0);
-	'ipv4.tcp.ack' -> 
-	    expr({p,{msh,?OFFS_IPV4_HLEN},?XOFFS_TCP_ACK,4},Sp0);
-	'ipv4.tcp.flags' ->
-	    expr({p,{msh,?OFFS_IPV4_HLEN},?XOFFS_TCP_FLAGS,2},Sp0);
-	'ipv4.tcp.window' -> 
-	    expr({p,{msh,?OFFS_IPV4_HLEN},?XOFFS_TCP_WINDOW,2}, Sp0);
-	'ipv4.tcp.csum' -> 
-	    expr({p,{msh,?OFFS_IPV4_HLEN},?XOFFS_TCP_CSUM,2}, Sp0);
-	'ipv4.tcp.uptr' -> 
-	    expr({p,{msh,?OFFS_IPV4_HLEN},?XOFFS_TCP_UPTR,2}, Sp0);
-	'ipv4.tcp.flag.fin' -> expr({'&','ipv4.tcp.flags', 16#1}, Sp0);
-	'ipv4.tcp.flag.syn' -> expr({'&',{'>>','ipv4.tcp.flags',1},1}, Sp0);
-	'ipv4.tcp.flag.rst' -> expr({'&',{'>>','ipv4.tcp.flags',2},1}, Sp0);
-	'ipv4.tcp.flag.psh' -> expr({'&',{'>>','ipv4.tcp.flags',3},1}, Sp0);
-	'ipv4.tcp.flag.ack' -> expr({'&',{'>>','ipv4.tcp.flags',4},1}, Sp0);
-	'ipv4.tcp.flag.urg' -> expr({'&',{'>>','ipv4.tcp.flags',5},1}, Sp0);
-	'ipv4.tcp.data_offset' ->
-	    expr({'>>',{'&',{p,{msh,?OFFS_IPV4_HLEN},
-			     ?XOFFS_TCP_FLAGS,1},16#f0},2}, Sp0);
-	'ipv4.tcp.data' -> %% start of data in data packet (offset)
-	    expr({'+','ipv4.tcp.data_offset','ipv4.tcp'}, Sp0);
+	"ip.dst"   -> iexpr(?OFFS_IPV4_DST,Offs,Sp);
+	"ip.src"   -> iexpr(?OFFS_IPV4_SRC,Offs,Sp);
+	"ip.dst["++Elem -> vexpr_(Elem, ?OFFS_IPV4_DST, Offs, Sp);
+	"ip.src["++Elem -> vexpr_(Elem, ?OFFS_IPV4_SRC, Offs, Sp);
+	"ip.dst."++Addr -> ipv4_address(Addr,?OFFS_IPV4_DST,Offs,Sp);
+	"ip.src."++Addr -> ipv4_address(Addr,?OFFS_IPV4_SRC,Offs,Sp);
+	"ip.host."++Addr ->
+	    expr_({'||', "ip.src."++Addr, "ip.dst."++Addr},Offs,Sp);
+	"ip.port."++PortStr -> %% currently udp/tcp (add stcp)
+	    expr_({'&&',
+		   [{'||',["ip.proto.tcp","ip.proto.udp"]},
+		    "ip.udp.port."++PortStr  %% udp & tcp has same offset
+		   ]}, Offs, Sp);
+	"ip.options" -> iexpr(?OFFS_IPV4_DATA,Offs,Sp);
+	"ip.data"  -> expr_({'+',?OFFS_ETH_DATA,"ip.hlen"},Offs,Sp);
+	"ip.data["++Elem -> xvexpr_(Elem, "ip.data", Offs, Sp);
+	    
+	%% ip6
+	"ip6["++Elem  -> vexpr_(Elem, ?OFFS_IPV6, Offs, Sp);	
+	"ip6.len"      -> expr_({p,?OFFS_IPV6_LEN,2},Offs,Sp);
+	"ip6.next"     -> expr_({p,?OFFS_IPV6_NEXT,1},Offs,Sp);
+	"ip6.proto"    -> expr_({p,?OFFS_IPV6_NEXT,1},Offs,Sp);
+	"ip6.proto."++Name -> ipv6_proto(Name,Offs,Sp);
+	"ip6.hopc"     -> expr_({p,?OFFS_IPV6_HOPC,1},Offs,Sp);
+	"ip6.payload"  -> iexpr(?OFFS_IPV6_PAYLOAD,Offs,Sp);
+	"ip6.data["++Elem -> vexpr_(Elem, ?OFFS_IPV6_PAYLOAD, Offs, Sp);
 
-	%% udp/ipv4
-	'ipv4.udp' -> expr('ipv4.data', Sp0); %% (offset)
-	'ipv4.udp.dst_port' -> 
-	    expr({p,{msh,?OFFS_IPV4_HLEN},?XOFFS_UDP_DST_PORT,2}, Sp0);
-	'ipv4.udp.src_port' ->
-	    expr({p,{msh,?OFFS_IPV4_HLEN},?XOFFS_UDP_SRC_PORT,2}, Sp0);
-	'ipv4.udp.length' -> 
-	    expr({p,{msh,?OFFS_IPV4_HLEN},?XOFFS_UDP_LENGTH,2}, Sp0);
-	'ipv4.udp.csum' ->
-	    expr({p,{msh,?OFFS_IPV4_HLEN},?XOFFS_UDP_CSUM,2}, Sp0);
-	'ipv4.udp.data' -> %% (offset to data)
-	    expr({'+','ipv4.hlen',?XOFFS_UDP_DATA}, Sp0);
+	%% different from ip since addresses do not fit in 32 bit
+	"ip6.dst"      -> iexpr(?OFFS_IPV6_DST,Offs,Sp);
+	"ip6.src"      -> iexpr(?OFFS_IPV6_SRC,Offs,Sp);
+	"ip6.dst["++Elem -> vexpr_(Elem, ?OFFS_IPV6_DST, Offs, Sp);
+	"ip6.src["++Elem -> vexpr_(Elem, ?OFFS_IPV6_SRC, Offs, Sp);
+	"ip6.dst."++Addr -> ipv6_address(Addr,?OFFS_IPV6_DST,Offs,Sp);
+	"ip6.src."++Addr -> ipv6_address(Addr,?OFFS_IPV6_SRC,Offs,Sp);
+	"ip6.host."++Addr ->
+	    expr_({'||', "ip6.src."++Addr, "ip6.dst."++Addr},Offs,Sp);
+	"ip6.port."++PortStr -> %% currently udp/tcp (add stcp)
+	    expr_({'&&',
+		   [{'||',["ip6.proto.tcp","ip6.proto.udp"]},
+		    "ip6.udp.port."++PortStr  %% udp & tcp has same offset
+		   ]}, Offs, Sp);
+	%% tcp/ip
+	"ip.tcp" -> expr_("ip.data",Offs,Sp);
+	"ip.tcp."++TcpAttr ->
+	    tcp_attr("ip.data",
+		     fun(Field,Size) ->
+			     {p,{msh,?OFFS_IPV4_HLEN},?OFFS_ETH_DATA+Field,Size}
+		     end,TcpAttr,Offs,Sp);
+	
+	%%  udp/ip
+	"ip.udp" -> expr_("ip.data",Offs,Sp);
+	"ip.udp."++UdpAttr ->
+	    udp_attr("ip.data",
+		     fun(Field,Size) ->
+			     {p,{msh,?OFFS_IPV4_HLEN},?OFFS_ETH_DATA+Field,Size}
+		     end,UdpAttr,Offs,Sp);
 
 	%% tcp/ipv6
-	'ipv6.tcp' -> expr('ipv6.payload', Sp0); %% (offset)
-	'ipv6.tcp.dst_port' -> 
-	    expr({p,?OFFS_IPV6_PAYLOAD+?OFFS_TCP_DST_PORT,2},Sp0);
-	'ipv6.tcp.src_port' -> 
-	    expr({p,?OFFS_IPV6_PAYLOAD+?OFFS_TCP_SRC_PORT,2},Sp0);
-	'ipv6.tcp.seq' ->
-	    expr({p,?OFFS_IPV6_PAYLOAD+?OFFS_TCP_SEQ,4},Sp0);
-	'ipv6.tcp.ack' -> 
-	    expr({p,?OFFS_IPV6_PAYLOAD+?OFFS_TCP_ACK,4},Sp0);
-	'ipv6.tcp.flags' ->
-	    expr({p,?OFFS_IPV6_PAYLOAD+?OFFS_TCP_FLAGS,2},Sp0);
-	'ipv6.tcp.window' -> 
-	    expr({p,?OFFS_IPV6_PAYLOAD+?OFFS_TCP_WINDOW,2}, Sp0);
-	'ipv6.tcp.csum' -> 
-	    expr({p,?OFFS_IPV6_PAYLOAD+?OFFS_TCP_CSUM,2}, Sp0);
-	'ipv6.tcp.uptr' -> 
-	    expr({p,?OFFS_IPV6_PAYLOAD+?OFFS_TCP_UPTR,2}, Sp0);
-	'ipv6.tcp.flag.fin' -> expr({'&','ipv6.tcp.flags', 16#1}, Sp0);
-	'ipv6.tcp.flag.syn' -> expr({'&',{'>>','ipv6.tcp.flags',1},1}, Sp0);
-	'ipv6.tcp.flag.rst' -> expr({'&',{'>>','ipv6.tcp.flags',2},1}, Sp0);
-	'ipv6.tcp.flag.psh' -> expr({'&',{'>>','ipv6.tcp.flags',3},1}, Sp0);
-	'ipv6.tcp.flag.ack' -> expr({'&',{'>>','ipv6.tcp.flags',4},1}, Sp0);
-	'ipv6.tcp.flag.urg' -> expr({'&',{'>>','ipv6.tcp.flags',5},1}, Sp0);
-	'ipv6.tcp.data_offset' ->
-	    expr({'>>',{'&',
-			{p,?OFFS_IPV6_PAYLOAD+?OFFS_TCP_FLAGS,1},16#f0},2},Sp0);
-	'ipv6.tcp.data' -> %% start of data in data packet (offset)
-	    expr({'+','ipv6.tcp.data_offset','ipv6.tcp'}, Sp0);
+	"ip6.tcp" -> expr_("ip6.payload",Offs,Sp);
+	"ip6.tcp."++TcpAttr ->
+	    tcp_attr("ip6.tcp",
+		     fun(Field,Size) ->
+			     {p,?OFFS_IPV6_PAYLOAD+Field,Size}
+		     end,TcpAttr,Offs,Sp);
+
 	%% udp/ipv6
-	'ipv6.udp.dst_port' -> 
-	    expr({p,?OFFS_IPV6_PAYLOAD+?OFFS_UDP_DST_PORT,2}, Sp0);
-	'ipv6.udp.src_port' ->
-	    expr({p,?OFFS_IPV6_PAYLOAD+?OFFS_UDP_SRC_PORT,2}, Sp0);
-	'ipv6.udp.length' -> 
-	    expr({p,?OFFS_IPV6_PAYLOAD+?OFFS_UDP_LENGTH,2}, Sp0);
-	'ipv6.udp.csum' ->
-	    expr({p,?OFFS_IPV6_PAYLOAD+?OFFS_UDP_CSUM,2}, Sp0)
+	"ip6.udp" -> expr_("ip6.payload",Offs,Sp);
+	"ip6.udp."++UdpAttr ->
+	    udp_attr("ip6.udp",
+		     fun(Field,Size) ->
+			     {p,?OFFS_IPV6_PAYLOAD+Field,Size}
+		     end,UdpAttr,Offs,Sp)
     end.
 
+%%
+%% Handle name[  <num>|<expr>[:1|2|4]  ']'
+%%
+vexpr_(StrExpr, POffs, Offs, Sp) ->
+    case string_split(StrExpr, ":") of
+	[IExpr,NExpr] when NExpr=:="1]"; NExpr=:="2]"; NExpr=:="4]" ->
+	    N = hd(NExpr)-$0,
+	    I = list_to_integer(IExpr),
+	    expr_({p,I,POffs,N}, Offs, Sp);
+	[IExpr1] ->
+	    [$]|IExpr2] = lists:reverse(IExpr1),
+	    I = list_to_integer(lists:reverse(IExpr2)),
+	    expr_({p,I,POffs,1}, Offs, Sp)
+    end.
 
-pexpr(Code,K0,Sp0) ->
-    K = pexpr_k(K0),
+xvexpr_(StrExpr, XOffs, Offs, Sp) ->
+    case string_split(StrExpr, ":") of
+	[IExpr,NExpr] when NExpr=:="1]"; NExpr=:="2]"; NExpr=:="4]" ->
+	    N = hd(NExpr)-$0,
+	    I = list_to_integer(IExpr),
+	    expr_({p,XOffs,I,N}, Offs, Sp);
+	[IExpr1] ->
+	    [$]|IExpr2] = lists:reverse(IExpr1),
+	    I = list_to_integer(lists:reverse(IExpr2)),
+	    expr_({p,XOffs,I,1}, Offs, Sp)
+    end.
+
+eth_type(Name, Offs, Sp) when is_list(Name) ->
+    Type = 
+	case Name of
+	    "ip" -> ?ETHERTYPE_IP;
+	    "ip6" -> ?ETHERTYPE_IPV6;
+	    "arp"  -> ?ETHERTYPE_ARP;
+	    "revarp" ->?ETHERTYPE_REVARP;
+	    "vlan" -> ?ETHERTYPE_VLAN
+	end,
+    expr_({'==',{p,?OFFS_ETH_TYPE,2},Type},Offs,Sp).
+
+ipv4_proto(Name,Offs,Sp) when is_list(Name) ->
+    Proto = case Name of
+		"tcp" -> ?IPPROTO_TCP;
+		"udp" -> ?IPPROTO_UDP;
+		"sctp" -> ?IPPROTO_SCTP;
+		"icmp" -> ?IPPROTO_ICMP
+	    end,
+    expr_({'==',"ip.proto",Proto},Offs,Sp).
+
+ipv6_proto(Name,Offs,Sp) when is_list(Name) ->
+    Proto = case Name of
+		"tcp" -> ?IPPROTO_TCP;
+		"udp" -> ?IPPROTO_UDP;
+		"sctp" -> ?IPPROTO_SCTP
+	    end,
+    expr_({'==',"ip6.proto",Proto},Offs,Sp).
+
+%%
+%%  1.2.3.4
+%%  192.168.0.0/24
+%%  192.168.0.2..192.168.0.10
+%%
+ipv4_address(Addr,IpOffs,Offs,Sp) ->
+    case string_split(Addr, "..") of
+	[A,B] ->
+	    {ok,IA} = inet_parse:ipv4_address(A),
+	    {ok,IB} = inet_parse:ipv4_address(B),
+	    expr_({'&&',
+		   {memge,IpOffs,ipv4(IA)},
+		   {memle,IpOffs,ipv4(IB)}},Offs,Sp);
+%%	    expr_({'&&',
+%%		   {'>=',{p,IpOffs,4},ipv4(IA)},
+%%		   {'<=',{p,IpOffs,4},ipv4(IB)}},Offs,Sp);
+	_ ->
+	    case string_split(Addr,"/") of
+		[A,N] ->
+		    {ok,IA} = inet_parse:ipv4_address(A),
+		    Net = list_to_integer(N),
+		    Mask = <<-1:Net,0:(32-Net)>>,
+		    expr_({memeq,IpOffs,Mask,ipv4(IA)},Offs,Sp);
+%%		    Mask = ((1 bsl Net)-1) bsl (32 - Net),
+%%		    expr_({'==', {'&', {p,IpOffs,4}, Mask}, ipv4(A)},Offs,Sp);
+		[A] ->
+		    {ok,IA} = inet_parse:ipv4_address(A),
+		    expr_({memeq,IpOffs,ipv4(IA)},Offs,Sp)
+%%		    expr_({'==',{p,IpOffs,4},ipv4(IA)},Offs,Sp)
+	    end
+    end.
+
+%%
+%% 1:2:3:4:5:6:7:8
+%% 1:2:3:4:5:6:7:8..1:2:3:4:5:6:7:1000
+%% 1:2:3:4:0:0:0:0/64
+%%
+ipv6_address(Addr,IpOffs,Offs,Sp) ->
+    case string_split(Addr, "..") of
+	[A,B] ->
+	    {ok,IA} = inet_parse:ipv6_address(A),
+	    {ok,IB} = inet_parse:ipv6_address(B),
+	    expr_({'&&',
+		   {memge,IpOffs,ipv6(IA)},
+		   {memle,IpOffs,ipv6(IB)}},Offs,Sp);
+	_ ->
+	    case string_split(Addr,"/") of
+		[A,N] ->
+		    {ok,IA} = inet_parse:ipv6_address(A),
+		    Net = list_to_integer(N),
+		    Mask = <<-1:Net,0:(128-Net)>>,
+		    expr_({memeq,IpOffs,Mask,ipv6(IA)},Offs,Sp);
+		[A] ->
+		    {ok,IA} = inet_parse:ipv6_address(A),
+		    expr_({memeq,IpOffs,ipv6(IA)},Offs,Sp)
+	    end
+    end.
+
+string_split(String, SubStr) ->
+    case string:str(String, SubStr) of
+	0 -> [String];
+	I -> 
+	    {A,B} = lists:split(I-1,String),
+	    [A, lists:nthtail(length(SubStr), B)]
+    end.
+    
+
+udp_attr(Start,Fld,Attr,Offs,Sp) ->
+    case Attr of
+	"dst_port" -> 
+	    expr_(Fld(?OFFS_UDP_DST_PORT,?U16), Offs,Sp);
+	"dst_port."++PortStr ->
+	    expr_(port_expr(PortStr,Fld,?OFFS_UDP_DST_PORT),Offs,Sp);
+	"src_port" ->
+	    expr_(Fld(?OFFS_UDP_SRC_PORT,?U16), Offs,Sp);
+	"src_port."++PortStr ->
+	    expr_(port_expr(PortStr,Fld,?OFFS_UDP_SRC_PORT),Offs,Sp);
+	"port."++PortStr ->
+	    Dst = port_expr(PortStr,Fld,?OFFS_UDP_DST_PORT),
+	    Src = port_expr(PortStr,Fld,?OFFS_UDP_SRC_PORT),
+	    expr_({'||', Dst, Src}, Offs, Sp);
+	"length"   -> expr_(Fld(?OFFS_UDP_LENGTH,?U16), Offs,Sp);
+	"csum"     -> expr_(Fld(?OFFS_UDP_CSUM,?U16), Offs,Sp);
+	"data"     -> expr_(udp_data_offs(Start),Offs,Sp);
+	"data["++Elem -> xvexpr_(Elem, udp_data_offs(Start), Offs, Sp)
+    end.
+
+udp_data_offs(Start) ->
+    {'+',Start,?OFFS_UDP_DATA}.
+
+
+tcp_attr(Start,Fld,Attr,Offs,Sp) ->
+    case Attr of
+	"dst_port" ->
+	    expr_(Fld(?OFFS_TCP_DST_PORT,?U16), Offs, Sp);
+	"dst_port."++PortStr ->
+	    expr_(port_expr(PortStr,Fld,?OFFS_TCP_DST_PORT),Offs,Sp);
+	"src_port" -> 
+	    expr_(Fld(?OFFS_TCP_SRC_PORT,?U16), Offs, Sp);
+	"src_port."++PortStr ->
+	    expr_(port_expr(PortStr,Fld,?OFFS_TCP_SRC_PORT),Offs,Sp);
+	"port."++PortStr ->
+	    Dst = port_expr(PortStr,Fld,?OFFS_TCP_DST_PORT),
+	    Src = port_expr(PortStr,Fld,?OFFS_TCP_SRC_PORT),
+	    expr_({'||', Dst, Src}, Offs, Sp);
+	"seq"      -> expr_(Fld(?OFFS_TCP_SEQ,?U32), Offs,Sp);
+	"ack"      -> expr_(Fld(?OFFS_TCP_ACK,?U32), Offs,Sp);
+	"flags"    -> expr_(Fld(?OFFS_TCP_FLAGS,?U16), Offs,Sp);
+	"window"   -> expr_(Fld(?OFFS_TCP_WINDOW,?U16), Offs,Sp);
+	"csum"     -> expr_(Fld(?OFFS_TCP_CSUM,?U16), Offs,Sp);
+	"uptr"     -> expr_(Fld(?OFFS_TCP_UPTR,?U16),Offs,Sp);
+	"flag.fin" -> tcp_flag_expr(Fld,0,Offs,Sp);
+	"flag.syn" -> tcp_flag_expr(Fld,1,Offs,Sp);
+	"flag.rst" -> tcp_flag_expr(Fld,2,Offs,Sp);
+	"flag.psh" -> tcp_flag_expr(Fld,3,Offs,Sp);
+	"flag.ack" -> tcp_flag_expr(Fld,4,Offs,Sp);
+	"flag.urg" -> tcp_flag_expr(Fld,5,Offs,Sp);
+	"data_offset" ->
+	    expr_(tcp_data_offs_expr(Fld),Offs,Sp);
+	"data" ->
+	    expr_(tcp_data_expr(Fld,Start), Offs, Sp);
+	"data["++Elem ->
+	    xvexpr_(Elem, tcp_data_expr(Fld,Start), Offs, Sp)
+    end.
+
+tcp_data_expr(Fld,Start) ->
+    {'+',tcp_data_offs_expr(Fld),Start}.
+
+tcp_data_offs_expr(Fld) ->
+    {'>>',{'&',Fld(?OFFS_TCP_FLAGS,?U8),16#f0},2}.
+
+%% handle port expressions num | num..num
+port_expr(PortStr,Fld,FOffs) ->
+    case string_split(PortStr,"..") of
+	[A,B] ->
+	    Ap = list_to_integer(A),
+	    Bp = list_to_integer(B),
+	    {'&&', {'>=',Fld(FOffs,?U16),Ap},{'<=',Fld(FOffs,?U16),Bp}};
+	[A] ->
+	    Ap = list_to_integer(A),
+	    {'==',Fld(FOffs,?U16),Ap}
+    end.
+	
+
+tcp_flag_expr(Fld, Num, Offs, Sp) ->
+    expr_({'&', {'>>',Fld(?OFFS_TCP_FLAGS,?U16), Num}, 1}, Offs, Sp).
+
+
+pexpr(Code,K0,Offs,Sp0) ->
+    %% io:format("pexpr: ~w\n", [{Code,K0,Offs,Sp0}]),
+    K = pexpr_k(K0)+Offs,
     Sp1 = Sp0-1,
     {Sp1, 
      [#bpf_insn { code=Code, k=K },
       #bpf_insn { code=sta, k=Sp1 }]}.
 
-pexpr(Code,Ax,K0,Sp0) ->  %% indexed expression
+pexpr(Code,Ax,K0,Offs,Sp0) ->  %% indexed expression
     K = pexpr_k(K0),
     {SpX,AcX} = case Ax of
 		    {msh,Kx} -> 
-			{Sp0-1,[#bpf_insn{code=ldxmsh,k=Kx}]};
+			{Sp0-1,[#bpf_insn{code=ldxmsh,k=Kx+Offs}]};
 		    _ ->
-			{Sp1,Ac} = expr(Ax, Sp0),
-			{Sp1,[Ac,#bpf_insn { code=ldx,  k=Sp1 }]}
+			{Sp1,Ac} = expr_(Ax,Offs,Sp0),
+			{Sp1,[Ac,#bpf_insn { code=ldx, k=Sp1}]}
 		end,
     {SpX, [AcX,
 	   #bpf_insn { code=Code, k=K }, 
@@ -2025,156 +2869,56 @@ pexpr(Code,Ax,K0,Sp0) ->  %% indexed expression
 pexpr_k(K) when is_integer(K) ->
     K;
 pexpr_k(K) when is_atom(K) ->
+    pexpr_k(atom_to_list(K));
+pexpr_k(K) when is_list(K) ->
     case K of
 	%% eth offsets
-	'eth.dst'    -> ?OFFS_ETH_DST;
-	'eth.src'    -> ?OFFS_ETH_SRC;
-	'eth.type'   -> ?OFFS_ETH_TYPE;
-	'eth.data'   -> ?OFFS_ETH_DATA;
+	"eth.dst"    -> ?OFFS_ETH_DST;
+	"eth.src"    -> ?OFFS_ETH_SRC;
+	"eth.type"   -> ?OFFS_ETH_TYPE;
+	"eth.data"   -> ?OFFS_ETH_DATA;
+
 	%% arp offsets
-	'arp.htype'   -> ?OFFS_ARP_HTYPE;
-	'arp.ptype'   -> ?OFFS_ARP_PTYPE;
-	'arp.halen'   -> ?OFFS_ARP_HALEN;
-	'arp.palen'   -> ?OFFS_ARP_PALEN;
-	'arp.op'      -> ?OFFS_ARP_OP;
+	"arp.htype"   -> ?OFFS_ARP_HTYPE;
+	"arp.ptype"   -> ?OFFS_ARP_PTYPE;
+	"arp.halen"   -> ?OFFS_ARP_HALEN;
+	"arp.palen"   -> ?OFFS_ARP_PALEN;
+	"arp.op"      -> ?OFFS_ARP_OP;
+
 	%% ipv4 offsets
-	'ipv4.hlen'  -> ?OFFS_IPV4_HLEN;
-	'ipv4.dsrv'  -> ?OFFS_IPV4_DSRV;
-	'ipv4.len'   -> ?OFFS_IPV4_LEN;
-	'ipv4.id'    -> ?OFFS_IPV4_ID;
-	'ipv4.frag'  -> ?OFFS_IPV4_FRAG;
-	'ipv4.ttl'   -> ?OFFS_IPV4_TTL;
-	'ipv4.proto' -> ?OFFS_IPV4_PROTO;
-	'ipv4.dst'   -> ?OFFS_IPV4_DST;
-	'ipv4.src'   -> ?OFFS_IPV4_SRC;
+	"ip.hlen"  -> ?OFFS_IPV4_HLEN;
+	"ip.dsrv"  -> ?OFFS_IPV4_DSRV;
+	"ip.len"   -> ?OFFS_IPV4_LEN;
+	"ip.id"    -> ?OFFS_IPV4_ID;
+	"ip.frag"  -> ?OFFS_IPV4_FRAG;
+	"ip.ttl"   -> ?OFFS_IPV4_TTL;
+	"ip.proto" -> ?OFFS_IPV4_PROTO;
+	"ip.dst"   -> ?OFFS_IPV4_DST;
+	"ip.src"   -> ?OFFS_IPV4_SRC;
+
 	%% ipv6 offsets
-	'ipv6.len'   -> ?OFFS_IPV6_LEN;
-	'ipv6.next'  -> ?OFFS_IPV6_NEXT;
-	'ipv6.hopc'  -> ?OFFS_IPV6_HOPC;
-	'ipv6.dst'   -> ?OFFS_IPV6_DST;
-	'ipv6.src'   -> ?OFFS_IPV6_SRC
+	"ip6.len"   -> ?OFFS_IPV6_LEN;
+	"ip6.next"  -> ?OFFS_IPV6_NEXT;
+	"ip6.hopc"  -> ?OFFS_IPV6_HOPC;
+	"ip6.dst"   -> ?OFFS_IPV6_DST;
+	"ip6.src"   -> ?OFFS_IPV6_SRC
     end.
 
-%% some common expressions
-is_arp() ->    {'==', 'eth.type', 'arp'}.
-is_revarp() -> {'==', 'eth.type', 'revarp'}.
-is_ipv4() ->   {'==', 'eth.type', 'ipv4'}.
-is_ipv6() ->   {'==', 'eth.type', 'ipv6'}.
-is_ip() ->     {'||', is_ipv4(), is_ipv6()}.
-is_ipv4_proto(Proto) ->
-    {'&&', is_ipv4(),  {'==', 'ipv4.proto', Proto }}.
-is_ipv6_proto(Proto) ->
-    {'&&', is_ipv6(),  {'==', 'ipv6.next',  Proto }}.
-is_tcp() ->
-    {'||',  is_ipv4_proto('tcp'), is_ipv6_proto('tcp')}.
-is_udp() ->
-    {'||',  is_ipv4_proto('udp'), is_ipv6_proto('udp')}.
-is_icmp() -> %% icmp6 is different ...
-    {'&&',   is_ipv4(), {'==', 'ipv4.proto', 'icmp' }}.
-is_ipv4_tcp_src(Src) ->
-    {'&&', is_ipv4_proto(tcp),  {'==','ipv4.src', ipv4(Src)}}.
-is_ipv4_tcp_dst(Dst) ->
-    {'&&', is_ipv4_proto(tcp), {'==','ipv4.dst', ipv4(Dst)}}.
-is_ipv4_tcp_dst_port(Port) ->
-    {'&&', is_ipv4_proto(tcp), {'==', 'ipv4.tcp.dst_port', Port}}.
-is_ipv4_tcp_src_port(Port) ->
-    {'&&', is_ipv4_proto(tcp), {'==', 'ipv4.tcp.src_port', Port}}.
-is_ipv6_tcp_dst_port(Port) ->
-    {'&&', is_ipv6_proto(tcp), {'==', 'ipv6.tcp.dst_port', Port}}.
-is_ipv6_tcp_src_port(Port) ->
-    {'&&', is_ipv6_proto(tcp), {'==', 'ipv6.tcp.src_port', Port}}.
-
-is_tcp_dst_port(Port) ->
-    {'||', is_ipv4_tcp_dst_port(Port), is_ipv6_tcp_dst_port(Port)}.
-is_tcp_src_port(Port) ->
-    {'||', is_ipv4_tcp_dst_port(Port), is_ipv6_tcp_dst_port(Port)}.
-
-is_tcp_syn() ->
-    {'||', 
-     {'&&', is_ipv4_proto(tcp), 'ipv4.tcp.flag.syn'},
-     {'&&', is_ipv6_proto(tcp), 'ipv6.tcp.flag.syn'}}.
-
-is_tcp_ack() ->
-    {'||', 
-     {'&&', is_ipv4_proto(tcp), 'ipv4.tcp.flag.ack'},
-     {'&&', is_ipv6_proto(tcp), 'ipv6.tcp.flag.ack'}}.
-
-is_tcp_fin() ->
-   {'||', 
-     {'&&', is_ipv4_proto(tcp), 'ipv4.tcp.flag.fin'},
-     {'&&', is_ipv6_proto(tcp), 'ipv6.tcp.flag.fin'}}.
-
-is_tcp_psh() ->
-   {'||', 
-     {'&&', is_ipv4_proto(tcp), 'ipv4.tcp.flag.psh'},
-     {'&&', is_ipv6_proto(tcp), 'ipv6.tcp.flag.psh'}}.
-
-is_tcp_urg() ->
-    {'||', 
-     {'&&', is_ipv4_proto(tcp), 'ipv4.tcp.flag.urg'},
-     {'&&', is_ipv6_proto(tcp), 'ipv6.tcp.flag.urg'}}.
-
-
-%% convert ipv4 address to uint32 format
-ipv4({A,B,C,D}) ->	  
-    (A bsl 24) + (B bsl 16) + (C bsl 8) + D;
+%% convert ipv4 address to binary format
+ipv4({A,B,C,D}) ->
+    <<A,B,C,D>>;
 ipv4(IPV4) when is_integer(IPV4) ->
-    ?uint32(IPV4).
+    <<IPV4:32>>;
+ipv4(String) ->
+    {ok,IP={_A,_B,_C,_D}} = inet_parse:address(String),
+    ipv4(IP).
 
-if_ethertype(Value, True, False) ->
-    [#bpf_insn{code=ldah, k=?OFFS_ETH_TYPE} | if_eqk(Value, True, False)].
-
-if_arpop(Value, True, False) ->
-    [#bpf_insn{code=ldah, k=?OFFS_ARP_OP} | if_eqk(Value, True, False)].
-
-if_ip_src(Value, True, False) ->
-    [#bpf_insn{code=ldaw, k=?OFFS_IPV4_SRC} | if_eqk(Value, True, False)].
-
-if_ip_dst(Value, True, False) ->
-    [#bpf_insn{code=ldaw, k=?OFFS_IPV4_DST} | if_eqk(Value, True, False)].
-
-if_ip_fragments(True, False) ->
-    [ #bpf_insn{code=ldah, k=?OFFS_IPV4_FRAG } | if_setk(16#1fff, True, False)].
-
-%% ipv4 | tcp/udp src port
-if_port_src(Value, True, False) ->
-    [ #bpf_insn{code=ldxmsh, k=?OFFS_IPV4_HLEN },
-      #bpf_insn{code=ldih, k=14 } | if_eqk(Value, True, False)].
-
-%% ipv4 | tcp/udp src port
-if_port_dst(Value, True, False) ->
-    [ #bpf_insn{code=ldxmsh, k=?OFFS_IPV4_HLEN },
-      #bpf_insn{code=ldih, k=16 } | if_eqk(Value, True, False)].
-    
-if_ip_protocol(Value, True, False) ->
-    [ #bpf_insn{code=ldab, k=?OFFS_IPV4_PROTO } | if_eqk(Value, True, False) ].
-
-if_tcp(True, False) ->
-    if_ip_protocol(?IPPROTO_TCP, True, False).
-
-if_udp(True, False) ->
-    if_ip_protocol(?IPPROTO_UDP, True, False).
-
-if_eqk(K, True, False) ->
-    if_opk(jeqk, K, True, False).
-
-if_gtk(K, True, False) ->
-    if_opk(jgtk, K, True, False).
-
-if_gek(K, True, False) ->
-    if_opk(jgek, K, True, False).
-
-if_setk(K, True, False) ->
-    if_opk(jsetk, K, True, False).
-
-if_opk(Op,K,True,False) ->
-    LT = code_length(True),
-    LF = code_length(False),
-    [ #bpf_insn{code=Op, k=K, jt=0, jf=LT+1 },
-      True,
-      #bpf_insn{code=jmp,k=LF+1},
-      False,
-      nop() ].
+%% convert ipv6 address to binary format
+ipv6({A,B,C,D,E,F,G,H}) ->
+    <<A:16,B:16,C:16,D:16,E:16,F:16,G:16,H:16>>;
+ipv6(String) ->
+    {ok,IP={_A,_B,_C,_D,_E,_F,_G,_H}} = inet_parse:address(String),
+    ipv6(IP).
 
 code_length(Code) ->
     lists:flatlength(Code).

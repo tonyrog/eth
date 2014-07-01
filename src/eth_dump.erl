@@ -45,7 +45,7 @@ start_link(Interface) when is_list(Interface) ->
 stop(Pid) ->
     gen_server:call(Pid, stop).
 
-%% only do statistic on what match the filter!
+%% only do statistic on what matched the filter!
 set_filter(Pid, Prog) when is_pid(Pid), is_tuple(Prog) ->
     Filter = eth_bpf:encode(Prog),
     gen_server:call(Pid, {set_filter, Filter}).

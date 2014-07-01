@@ -8,6 +8,7 @@
 #include <stdint.h>
 #include <unistd.h>
 #include <errno.h>
+#include <memory.h>
 
 #if defined(__linux__)
 #include <sys/socket.h>
@@ -39,6 +40,13 @@
 typedef int  ErlDrvSizeT;
 typedef int  ErlDrvSSizeT;
 #endif
+
+#if (ERL_DRV_EXTENDED_MAJOR_VERSION > 2) || ((ERL_DRV_EXTENDED_MAJOR_VERSION == 2) && (ERL_DRV_EXTENDED_MINOR_VERSION >= 1))
+#define SEND_TERM(ctx, to, message, len) erl_drv_send_term((ctx)->dport,(to),(message),(len))
+#else
+#define SEND_TERM(ctx, to, message, len) driver_send_term((ctx)->port,(to),(message),(len))
+#endif
+
 
 #define PORT_CONTROL_BINARY
 
@@ -214,9 +222,7 @@ static ErlDrvEntry eth_drv_entry;
 #define DLOG(level,file,line,args...) do {				\
 	if (((level) == DLOG_EMERGENCY) ||				\
 	    ((debug_level >= 0) && ((level) <= debug_level))) {		\
-	    int save_errno = errno;					\
 	    emit_log((level),(file),(line),args);			\
-	    errno = save_errno;						\
 	}								\
     } while(0)
 
@@ -238,12 +244,14 @@ static void emit_log(int level, char* file, int line, ...)
 
     if ((level == DLOG_EMERGENCY) ||
 	((debug_level >= 0) && (level <= debug_level))) {
+	int save_errno = errno;
 	va_start(ap, line);
 	fmt = va_arg(ap, char*);
 	fprintf(stderr, "%s:%d: ", file, line); 
 	vfprintf(stderr, fmt, ap);
 	fprintf(stderr, "\r\n");
 	va_end(ap);
+	errno = save_errno;
     }
 }
 
@@ -580,7 +588,7 @@ static int deliver_active(eth_ctx_t* ctx, ErlDrvTermData pid, int is_active)
     push_pid(pid);
     push_atom(is_active ? ATOM(true) : ATOM(false));
     push_tuple(4);
-    return driver_send_term(ctx->port, ctx->owner, message, i);
+    return SEND_TERM(ctx, ctx->owner, message, i);
 }
 
 
@@ -605,7 +613,7 @@ static int deliver_frame(eth_ctx_t* ctx, uint8_t* p, uint32_t len)
 	if (ptr->active != 0) {
 	    if (eth_bpf_exec(ptr->prog, ptr->plen, p, len, 
 			     &bpf_err, &bpf_err_loc)) {
-		driver_send_term(ctx->port, ptr->pid, message, i);
+		SEND_TERM(ctx, ptr->pid, message, i);
 		if (ptr->active > 0)
 		    ptr->active--;
 		if (ptr->active == 0) {

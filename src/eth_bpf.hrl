@@ -86,28 +86,24 @@
 	  k    = 0 :: uint32_t()
 	}).
 
-%% fanin  = calculated 
-%% fanout = calculated if jmp then [k] 
-%%                     if jxy then [jt,jf]
-%%                     if ret then []
-%% access = {a,<value>}        
-%%        | {x,<value>} 
-%%        | {{m,<k>},<value>}
+%%
+%%
 %%
 -record(bpf_block,
 	{
 	  label = 0  :: uint32_t(),    %% could be (nearly) anything
 	  insns = [] :: [#bpf_insn{}], %% non jump code
+	  ncond      :: term(),        %% computed jump condition f(P)
 	  next       :: #bpf_insn{}    %% jmp/ret instruction 
 	}).
 
 -record(bpf_bs,
 	{
 	  init :: term(),             %% label of start block
-	  changed = 0 :: integer(),
-	  block  :: dict(),
-	  fanin  :: dict(),
-	  fanout :: dict()
+	  changed = 0 :: integer(),   %% change counter
+	  block  :: dict:dict(),           %% label() -> #bpf_block{}
+	  fanin  :: dict:dict(),           %% label() -> [label()]
+	  fanout :: dict:dict()            %% label() -> [label()]
 	}).
 
 %% 

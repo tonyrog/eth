@@ -66,9 +66,12 @@ init([Interface]) ->
     case eth_devices:open(Interface) of
 	{ok,Port} ->
 	    T = ets:new(contrack, []),
-	    Prog = eth_bpf:build_programx({'||', 
-					   connect_filter(),
-					   disconnect_filter()}),
+	    Prog = eth_bpf:build_programx(
+		     {'||', 
+		      [connect_filter(),
+		       disconnect_filter(),
+		       reset_filter()
+		      ]}),
 	    Filter = eth_bpf:encode(Prog),
 	    case eth:set_filter(Port, Filter) of
 		ok ->
@@ -138,7 +141,7 @@ handle_info({eth_frame,_Port,_IfIndex,Data}, State) ->
 		    Key = {IPv4#ipv4.src, IPv4#ipv4.dst,
 			   Tcp#tcp.src_port, Tcp#tcp.dst_port},
 		    ets:insert(State#state.con, {Key,true});
-	       Tcp#tcp.fin, Tcp#tcp.ack ->
+	       Tcp#tcp.fin, Tcp#tcp.ack; Tcp#tcp.rst ->
 		    Key = {IPv4#ipv4.src, IPv4#ipv4.dst,
 			   Tcp#tcp.src_port, Tcp#tcp.dst_port},
 		    ets:delete(State#state.con, Key);
@@ -186,16 +189,21 @@ code_change(_OldVsn, State, _Extra) ->
 
 %% TCP - SYN/ACK => established
 connect_filter() ->
-    {'&&', ['eth.type.ipv4',
-	    'ipv4.proto.tcp',
-	    {'==','ipv4.frag',0},
-	    'ipv4.tcp.flag.syn',
-	    'ipv4.tcp.flag.ack']}.
+    {'&&', ["eth.type.ip", "ip.proto.tcp",
+	    {'==',"ip.frag",0},
+	    "ip.tcp.flag.syn", "ip.tcp.flag.ack"
+	   ]}.
 
 %% TCP - FIN/ACK => disconnected
 disconnect_filter() ->
-    {'&&', ['eth.type.ipv4',
-	    'ipv4.proto.tcp',
-	    {'==','ipv4.frag',0},
-	    'ipv4.tcp.flag.fin',
-	    'ipv4.tcp.flag.ack']}.
+    {'&&', ["eth.type.ip", "ip.proto.tcp",
+	    {'==',"ip.frag",0},
+	    "ip.tcp.flag.fin","ip.tcp.flag.ack"
+	   ]}.
+
+reset_filter() ->
+    {'&&', ["eth.type.ip", "ip.proto.tcp",
+	    {'==',"ip.frag",0},
+	    "ip.tcp.flag.rst"
+	   ]}.
+
