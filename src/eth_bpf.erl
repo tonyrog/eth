@@ -2527,6 +2527,10 @@ attr(Attr,Offs,Sp) ->
     case Attr of
 	%% ethernet
 	"eth["++Elem      -> vexpr_(Elem, ?OFFS_ETH, Offs, Sp);
+	"eth.dst."++Addr  -> eth_address(Addr,?OFFS_ETH_DST,Offs,Sp);
+	"eth.src."++Addr  -> eth_address(Addr,?OFFS_ETH_SRC,Offs,Sp);
+	"eth.dst["++Elem  -> vexpr_(Elem,?OFFS_ETH_DST,Offs,Sp);
+	"eth.src["++Elem  -> vexpr_(Elem,?OFFS_ETH_SRC,Offs,Sp);
 	"eth.type"        -> expr_({p,?OFFS_ETH_TYPE,2},Offs,Sp);
 	"eth.type."++Type -> eth_type(Type, Offs, Sp);
 	"eth.data"        -> iexpr(?OFFS_ETH_DATA,Offs,Sp);
@@ -2695,7 +2699,32 @@ ipv6_proto(Name,Offs,Sp) when is_list(Name) ->
 		"sctp" -> ?IPPROTO_SCTP
 	    end,
     expr_({'==',"ip6.proto",Proto},Offs,Sp).
-
+%%
+%% 11:22:33:44:55:66 
+%% 11:22:33:44:55:66/16
+%% 11:22:00:00:00:01..11:22:00:00:00:ff
+%%
+eth_address(Addr,IpOffs,Offs,Sp) ->
+    case string_split(Addr, "..") of
+	[A,B] ->
+	    {ok,IA} = eth_address(A),
+	    {ok,IB} = eth_address(B),
+	    expr_({'&&',
+		   {memge,IpOffs,eth(IA)},
+		   {memle,IpOffs,eth(IB)}},Offs,Sp);
+	_ ->
+	    case string_split(Addr,"/") of
+		[A,N] ->
+		    {ok,IA} = eth_address(A),
+		    Net = list_to_integer(N),
+		    Mask = <<-1:Net,0:(48-Net)>>,
+		    expr_({memeq,IpOffs,Mask,eth(IA)},Offs,Sp);
+		[A] ->
+		    {ok,IA} = eth_address(A),
+		    expr_({memeq,IpOffs,eth(IA)},Offs,Sp)
+	    end
+    end.
+	
 %%
 %%  1.2.3.4
 %%  192.168.0.0/24
@@ -2709,9 +2738,6 @@ ipv4_address(Addr,IpOffs,Offs,Sp) ->
 	    expr_({'&&',
 		   {memge,IpOffs,ipv4(IA)},
 		   {memle,IpOffs,ipv4(IB)}},Offs,Sp);
-%%	    expr_({'&&',
-%%		   {'>=',{p,IpOffs,4},ipv4(IA)},
-%%		   {'<=',{p,IpOffs,4},ipv4(IB)}},Offs,Sp);
 	_ ->
 	    case string_split(Addr,"/") of
 		[A,N] ->
@@ -2719,12 +2745,9 @@ ipv4_address(Addr,IpOffs,Offs,Sp) ->
 		    Net = list_to_integer(N),
 		    Mask = <<-1:Net,0:(32-Net)>>,
 		    expr_({memeq,IpOffs,Mask,ipv4(IA)},Offs,Sp);
-%%		    Mask = ((1 bsl Net)-1) bsl (32 - Net),
-%%		    expr_({'==', {'&', {p,IpOffs,4}, Mask}, ipv4(A)},Offs,Sp);
 		[A] ->
 		    {ok,IA} = inet_parse:ipv4_address(A),
 		    expr_({memeq,IpOffs,ipv4(IA)},Offs,Sp)
-%%		    expr_({'==',{p,IpOffs,4},ipv4(IA)},Offs,Sp)
 	    end
     end.
 
@@ -2752,6 +2775,37 @@ ipv6_address(Addr,IpOffs,Offs,Sp) ->
 		    {ok,IA} = inet_parse:ipv6_address(A),
 		    expr_({memeq,IpOffs,ipv6(IA)},Offs,Sp)
 	    end
+    end.
+
+%% parse an ethernet address
+%% 
+eth_address(String) ->
+    case string_split_all(String, ":") of
+	[A,B,C,D,E,F] ->
+	    try {x8(A),x8(B),x8(C),x8(D),x8(E),x8(F)} of
+		Mac -> {ok,Mac}
+	    catch
+		error:_ ->
+		    {error, einval}
+	    end;
+	_ ->
+	    {error, einval}
+    end.
+
+x8("") -> 0;
+x8(String) -> list_to_integer(String,16) band 16#ff.
+
+%% recursivly split the string in parts
+
+string_split_all(String, SubStr) ->
+    string_split_all(String, SubStr, []).
+
+string_split_all(String, SubStr, Acc) ->
+    case string_split(String, SubStr) of
+	[Part] ->
+	    lists:reverse([Part | Acc]);
+	[Part,Parts] ->
+	    string_split_all(Parts,SubStr,[Part|Acc])
     end.
 
 string_split(String, SubStr) ->
@@ -2909,16 +2963,23 @@ ipv4({A,B,C,D}) ->
     <<A,B,C,D>>;
 ipv4(IPV4) when is_integer(IPV4) ->
     <<IPV4:32>>;
-ipv4(String) ->
-    {ok,IP={_A,_B,_C,_D}} = inet_parse:address(String),
+ipv4(String) when is_list(String) ->
+    {ok,IP} = inet_parse:ipv4_address(String),
     ipv4(IP).
 
 %% convert ipv6 address to binary format
 ipv6({A,B,C,D,E,F,G,H}) ->
     <<A:16,B:16,C:16,D:16,E:16,F:16,G:16,H:16>>;
-ipv6(String) ->
-    {ok,IP={_A,_B,_C,_D,_E,_F,_G,_H}} = inet_parse:address(String),
+ipv6(String) when is_list(String) ->
+    {ok,IP} = inet_parse:ipv6_address(String),
     ipv6(IP).
+
+eth({A,B,C,D,E,F}) ->
+    <<A,B,C,D,E,F>>;
+eth(String) when is_list(String) ->
+    {ok,Mac} = eth_address(String),
+    eth(Mac).
+
 
 code_length(Code) ->
     lists:flatlength(Code).
