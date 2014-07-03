@@ -7,6 +7,23 @@
 
 -ifndef(__BPF_HRL__).
 -define(__BPF_HRL__, true).
+
+-define(uint32(X), ((X) band 16#ffffffff)).
+
+-ifdef(DEBUG).
+-define(debug(F,A),
+	 io:format("~s:~w: debug: "++(F), [?FILE,?LINE|(A)])).
+-else.
+-define(debug(F,A), ok).
+-endif.
+
+-define(warning(F,A), 
+	io:format("~s:~w: warning: "++(F), [?FILE,?LINE|(A)])).
+-define(error(F,A),
+	io:format("~s:~w: error: "++(F), [?FILE,?LINE|(A)])).
+-define(info(F,A),
+	io:format("~s:~w: info: "++(F), [?FILE,?LINE|(A)])).
+
 %%
 %% The instruction encodings.
 %% <<_:5,Class:3>>

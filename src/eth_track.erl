@@ -189,20 +189,20 @@ code_change(_OldVsn, State, _Extra) ->
 
 %% TCP - SYN/ACK => established
 connect_filter() ->
-    {'&&', ["eth.type.ip", "ip.proto.tcp",
+    {'&&', ["ether.type.ip", "ip.proto.tcp",
 	    {'==',"ip.frag",0},
 	    "ip.tcp.flag.syn", "ip.tcp.flag.ack"
 	   ]}.
 
 %% TCP - FIN/ACK => disconnected
 disconnect_filter() ->
-    {'&&', ["eth.type.ip", "ip.proto.tcp",
+    {'&&', ["ether.type.ip", "ip.proto.tcp",
 	    {'==',"ip.frag",0},
 	    "ip.tcp.flag.fin","ip.tcp.flag.ack"
 	   ]}.
 
 reset_filter() ->
-    {'&&', ["eth.type.ip", "ip.proto.tcp",
+    {'&&', ["ether.type.ip", "ip.proto.tcp",
 	    {'==',"ip.frag",0},
 	    "ip.tcp.flag.rst"
 	   ]}.
