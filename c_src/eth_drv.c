@@ -724,7 +724,7 @@ static ErlDrvData eth_drv_start(ErlDrvPort port, char* command)
     ctx->port         = port;
     ctx->dport        = driver_mk_port(port);
     ctx->owner        = driver_connected(port);
-    ctx->fd           = (ErlDrvEvent)fd;
+    ctx->fd           = (ErlDrvEvent)((long)fd);
     ctx->if_index     = -1;
 
     if (setup_input_buffer(ctx) < 0) {
