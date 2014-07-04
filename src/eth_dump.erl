@@ -47,7 +47,7 @@ stop(Pid) ->
 
 %% only do statistic on what matched the filter!
 set_filter(Pid, Prog) when is_pid(Pid), is_tuple(Prog) ->
-    Filter = eth_bpf:encode(Prog),
+    Filter = bpf:asm(Prog),
     gen_server:call(Pid, {set_filter, Filter}).
 
 %% set output style

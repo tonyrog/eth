@@ -72,7 +72,7 @@ init([Interface]) ->
 		       disconnect_filter(),
 		       reset_filter()
 		      ]}),
-	    Filter = eth_bpf:encode(Prog),
+	    Filter = bpf:asm(Prog),
 	    case eth:set_filter(Port, Filter) of
 		ok ->
 		    eth:set_active(Port, -1),
