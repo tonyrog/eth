@@ -11,6 +11,7 @@
 #include <memory.h>
 
 #if defined(__linux__)
+#include <sys/types.h>
 #include <sys/socket.h>
 #include <netpacket/packet.h>
 #include <net/ethernet.h>
@@ -643,9 +644,13 @@ static int deliver_frame(eth_ctx_t* ctx, uint8_t* p, uint32_t len)
 static int input_frame(eth_ctx_t* ctx)
 {
 #if defined(__linux__)
+    int saddr_size;
+    struct sockaddr saddr;
     int n;
-    if ((n = read(INT_EVENT(ctx->fd), ctx->ibuf, ctx->ibuflen)) > 0) {
-
+    //if ((n = read(INT_EVENT(ctx->fd), ctx->ibuf, ctx->ibuflen)) > 0) {
+    // check if recvfrom deliver correct length for arp packets
+    if ((n = recvfrom(INT_EVENT(ctx->fd), ctx->ibuf, ctx->ibuflen,
+		      0, &saddr, (socklen_t*)&saddr_size)) > 0) {
 	deliver_frame(ctx, ctx->ibuf, n);
     }
     else if (n < 0) {
@@ -724,7 +729,7 @@ static ErlDrvData eth_drv_start(ErlDrvPort port, char* command)
     ctx->port         = port;
     ctx->dport        = driver_mk_port(port);
     ctx->owner        = driver_connected(port);
-    ctx->fd           = (ErlDrvEvent)fd;
+    ctx->fd           = (ErlDrvEvent)((long)fd);
     ctx->if_index     = -1;
 
     if (setup_input_buffer(ctx) < 0) {
