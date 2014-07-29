@@ -54,7 +54,7 @@ set_filter(Interface, Filter) when is_list(Interface) ->
 	Error -> Error
     end;
 set_filter(Port, Prog) when is_port(Port), is_tuple(Prog) ->
-    Filter = eth_bpf:encode(Prog),
+    Filter = bpf:asm(Prog),
     eth_devices:pid_set_filter(Port, Filter);
 set_filter(Port, Filter) when is_port(Port), is_binary(Filter) ->
     eth_devices:pid_set_filter(Port, Filter).

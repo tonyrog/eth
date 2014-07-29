@@ -50,7 +50,7 @@ stop(Pid) ->
 
 %% only do statistic on what match the filter!
 set_filter(Pid, Prog) when is_pid(Pid), is_tuple(Prog) ->
-    Filter = eth_bpf:encode(Prog),
+    Filter = bpf:asm(Prog),
     gen_server:call(Pid, {set_filter, Filter}).
 
 %% controls how many packets that should be handled:

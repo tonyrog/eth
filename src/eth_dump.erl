@@ -16,7 +16,10 @@
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
 	 terminate/2, code_change/3]).
 
--export([set_filter/2, set_active/2, set_active_time/2, set_style/2, stop/1]).
+-export([set_filter/2, set_filterx/2,
+	 set_active/2, set_active_time/2, set_style/2, stop/1]).
+
+-export([start/1]).
 
 -include_lib("enet/include/enet_types.hrl").
 
@@ -30,6 +33,11 @@
 %%%===================================================================
 %%% API
 %%%===================================================================
+
+%% shell version
+start(Interface) ->
+    application:start(eth),
+    gen_server:start(?MODULE, [Interface], []).
 
 %%--------------------------------------------------------------------
 %% @doc
@@ -46,8 +54,14 @@ stop(Pid) ->
     gen_server:call(Pid, stop).
 
 %% only do statistic on what matched the filter!
+set_filterx(Pid, Expr) when is_pid(Pid) ->
+    case eth_bpf:build_programx(Expr) of
+	E = {error,_} -> E;
+	Prog -> set_filter(Pid, Prog)
+    end.
+
 set_filter(Pid, Prog) when is_pid(Pid), is_tuple(Prog) ->
-    Filter = eth_bpf:encode(Prog),
+    Filter = bpf:asm(Prog),
     gen_server:call(Pid, {set_filter, Filter}).
 
 %% set output style
