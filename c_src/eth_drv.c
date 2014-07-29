@@ -108,16 +108,19 @@ static inline uint16_t get_uint16(uint8_t* ptr)
     return value;
 }
 
+#if 0
 static inline uint8_t get_uint8(uint8_t* ptr)
 {
     return ptr[0];
 }
+#endif
 
 static inline int8_t get_int8(uint8_t* ptr)
 {
     return (int8_t) ptr[0];
 }
 
+#if 0
 static inline void put_uint16(uint8_t* ptr, uint16_t v)
 {
     ptr[0] = v>>8;
@@ -131,7 +134,7 @@ static inline void put_uint32(uint8_t* ptr, uint32_t v)
     ptr[2] = v>>8;
     ptr[3] = v;
 }
-
+#endif
 
 static int  eth_drv_init(void);
 static void eth_drv_finish(void);
