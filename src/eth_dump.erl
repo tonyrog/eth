@@ -36,7 +36,7 @@
 
 %% shell version
 start(Interface) ->
-    application:start(eth),
+    application:ensure_all_started(eth),
     gen_server:start(?MODULE, [Interface], []).
 
 %%--------------------------------------------------------------------

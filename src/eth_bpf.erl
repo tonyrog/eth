@@ -604,7 +604,8 @@ ipv6_proto(Name,Offs,Sp) when is_list(Name) ->
     Proto = case Name of
 		"tcp" -> ?IPPROTO_TCP;
 		"udp" -> ?IPPROTO_UDP;
-		"sctp" -> ?IPPROTO_SCTP
+		"sctp" -> ?IPPROTO_SCTP;
+		"icmp" -> ?IPPROTO_ICMP6
 	    end,
     expr_({'==',"ip6.proto",Proto},Offs,Sp).
 %%

@@ -245,13 +245,20 @@ hex_norm_nibbles([]) ->
 
 is_pkt_record(P) ->
     case P of
-	#eth{}  -> true;
-	#arp{}  -> true;
+	#eth{} -> true;
+	#arp{} -> true;
 	#ipv4{} -> true;
-	#udp{}  -> true;
-	#icmp{}  -> true;
-	#tcp{}  -> true;
+	#udp{} -> true;
+	#icmp{} -> true;
+	#icmp6{} -> true;
+	#tcp{} -> true;
 	#ipv6{} -> true;
+	#dhcp{} -> true;
+	#dns_rec{} -> true;
+	#dns_header{} -> true;
+	#dns_query{} -> true;
+	#dns_rr{} -> true;
+	#dns_rr_opt{} -> true;
 	_ -> false
     end.
 
@@ -259,11 +266,18 @@ pkt_fields(P) ->
     case P of
 	#eth{} -> record_info(fields,eth);
 	#arp{} -> record_info(fields,arp);
-	#ipv4{} ->record_info(fields,ipv4);
-	#udp{} ->record_info(fields,udp);
-	#icmp{} ->record_info(fields,icmp);
-	#tcp{} ->record_info(fields,tcp);
-	#ipv6{} ->record_info(fields,ipv6);
+	#ipv4{} -> record_info(fields,ipv4);
+	#udp{} -> record_info(fields,udp);
+	#icmp{} -> record_info(fields,icmp);
+	#icmp6{} -> record_info(fields,icmp6);
+	#tcp{} -> record_info(fields,tcp);
+	#ipv6{} -> record_info(fields,ipv6);
+	#dhcp{} -> record_info(fields,dhcp);
+	#dns_rec{} -> record_info(fields,dns_rec);
+	#dns_header{} -> record_info(fields,dns_header);
+	#dns_query{} -> record_info(fields,dns_query);
+	#dns_rr{} -> record_info(fields,dns_rr);
+	#dns_rr_opt{} -> record_info(fields,dns_rr_opt);
 	_ -> []
     end.
     

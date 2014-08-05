@@ -34,6 +34,7 @@
 -define(IPPROTO_ICMP, 1).
 -define(IPPROTO_TCP,  6).
 -define(IPPROTO_UDP,  17).
+-define(IPPROTO_ICMP6, 58).
 -define(IPPROTO_SCTP, 132).
 
 -define(OFFS_ETH,        (0)).
