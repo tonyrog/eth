@@ -9,6 +9,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <memory.h>
+#include <fcntl.h>
 
 #if defined(__linux__)
 #include <sys/types.h>
@@ -329,7 +330,7 @@ static eth_sub_t** find_or_create_sub(eth_ctx_t* ctx, ErlDrvTermData pid)
 
 static int open_device(int tap)
 {
-    int  i,fd;
+    int  fd;
     char devname[32];
 
     if (tap >= 0) {
@@ -347,6 +348,7 @@ static int open_device(int tap)
 	// could select ETH_P_ARP/ETH_P_8021Q ...
 	return socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
 #elif defined(__APPLE__)
+	int i;
 	for (i = 0; i < 255; i++) {
 	    sprintf(devname, "/dev/bpf%d", i);
 	    DEBUGF("try open device %s", devname);
@@ -578,7 +580,7 @@ static int unbind_interface(eth_ctx_t* ctx)
 
 static int get_bpf_stat(eth_ctx_t* ctx, uint32_t stat[2])
 {
-    stat[0] = stat[0] = 0;
+    stat[0] = stat[1] = 0;
     if (ctx->tap < 0) {
 #if defined(__APPLE__)
 	struct bpf_stat bst;
