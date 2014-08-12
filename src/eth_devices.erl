@@ -17,6 +17,7 @@
 -export([get_list/0, i/0]).
 -export([send/2]).
 -export([get_stat/1]).
+-export([get_name/1]).
 
 %% direct api from eth
 -export([pid_get_stat/1,pid_set_active/2, pid_set_filter/2]).
@@ -58,6 +59,7 @@
 -define(CMD_PID_SET_FILTER,   6).
 -define(CMD_PID_GET_STAT,     7).
 -define(CMD_GET_STAT,         8).
+-define(CMD_GET_NAME,         9).
 
 -define(DLOG_DEBUG,     7).
 -define(DLOG_INFO,      6).
@@ -128,6 +130,9 @@ get_stat(Port) when is_port(Port) ->
 	{ok,A,B} -> {ok, [{recv,A},{drop,B}]};
 	Error -> Error
     end.
+
+get_name(Port) when is_port(Port) ->
+    port_call(Port, ?CMD_GET_NAME, []).
 
 %%
 %% List ethernet device information
@@ -246,8 +251,8 @@ handle_call({open,Name}, _From, State) ->
 		    try erlang:open_port({spawn_driver, Driver},[binary]) of
 			Port ->
 			    case port_call(Port, ?CMD_BIND, Name) of
-				ok ->
-				    D1 = D#device { port=Port },
+				{ok,Name1} ->
+				    D1 = D#device { name=Name1, port=Port },
 				    %% inform subscriber that interface is open?
 				    %% re-set the filter ...
 				    Ds1 = [D1 | Ds],
@@ -421,13 +426,15 @@ port_call(Port, Cmd, Data) ->
 	    ok;
 	<<255,E/binary>> -> 
 	    {error, erlang:binary_to_atom(E, latin1)};
-	<<254,E/binary>> -> 
+	<<254,E/binary>> ->
 	    {error, binary_to_list(E)};
+	
 	<<1,Y>> -> {ok,Y};
 	<<2,Y:16/native-unsigned>> -> {ok, Y};
 	<<4,Y:32/native-unsigned>> -> {ok, Y};
 	<<8,A:32/native-unsigned,B:32/native-unsigned>> -> {ok,A,B};
-	<<3,Return/binary>> -> {ok,Return}
+	<<3,Return/binary>> -> {ok,Return};
+	<<5,Return/binary>> -> {ok,binary_to_list(Return)}
     end.
 
 delete_subscription(Device, Pid) ->
@@ -482,4 +489,4 @@ level(none) -> ?DLOG_NONE.
 get_if_addr_list() ->
     {ok,IFs} = inet:getifaddrs(),
     %% add tap interfaces tap0..tap9
-    IFs ++ [{"tap"++[N],[]} || N <- lists:seq($0,$9)].
+    IFs ++ [{"tap",[]}] ++ [{"tap"++[N],[]} || N <- lists:seq($0,$9)].

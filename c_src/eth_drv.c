@@ -9,6 +9,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <memory.h>
+#include <ctype.h>
 #include <fcntl.h>
 
 #if defined(__linux__)
@@ -17,9 +18,11 @@
 #include <netpacket/packet.h>
 #include <net/ethernet.h>
 #include <arpa/inet.h>
-#include <net/if.h>
+#include <linux/if.h>
+#include <linux/if_tun.h>
 #include <sys/ioctl.h>
 #include <linux/filter.h>
+
 #elif defined(__APPLE__)
 #include <fcntl.h>
 #include <sys/socket.h>
@@ -70,7 +73,7 @@ typedef struct _eth_ctx_t
 {
     ErlDrvPort  port;
     ErlDrvEvent fd;
-    int         tap;           // tap number or -1 if bpf/packet device
+    int         is_tap;        // 1 = tap device, 0 network device or bpf dev
     ErlDrvTermData owner;      // port owner
     char*       if_name;       // interface name
     int         if_index;      // interface index
@@ -90,6 +93,7 @@ typedef struct _eth_ctx_t
 #define CMD_PID_SET_FILTER    6
 #define CMD_PID_GET_STAT      7
 #define CMD_GET_STAT          8
+#define CMD_GET_NAME          9
 
 
 static inline uint32_t get_uint32(uint8_t* ptr)
@@ -261,6 +265,14 @@ static void emit_log(int level, char* file, int line, ...)
     }
 }
 
+static char* driver_copy_string(char* str)
+{
+    int n = strlen(str) + 1;
+    char* ptr = driver_alloc(n);
+    strcpy(ptr, str);
+    return ptr;
+}
+
 /* general control reply function */
 static ErlDrvSSizeT ctl_reply(int rep, char* buf, ErlDrvSizeT len,
 			      char** rbuf, ErlDrvSizeT rsize)
@@ -328,19 +340,57 @@ static eth_sub_t** find_or_create_sub(eth_ctx_t* ctx, ErlDrvTermData pid)
 }
 
 
-static int open_device(int tap)
+static int open_device(int is_tap, char* name, char** ifname)
 {
-    int  fd;
-    char devname[32];
+    int  fd = -1;
 
-    if (tap >= 0) {
-	sprintf(devname, "/dev/tap%d", tap);
-	DEBUGF("try open device %s", devname);
-	if ((fd = open(devname, O_RDWR)) >= 0) {
-	    DEBUGF("/dev/tap%d is opened for read and write", tap);
-	    return fd;
-	}
-	return -1;
+    if (is_tap) {
+#if defined(__linux__)
+      struct ifreq ifr;
+      int fd, err;
+
+      if ((fd = open("/dev/net/tun", O_RDWR)) < 0)
+	  return -1;
+      memset(&ifr, 0, sizeof(ifr));
+      ifr.ifr_flags = IFF_TAP|IFF_NO_PI;
+      if (isdigit(name[3]))  // tap<d> ?
+	  strncpy(ifr.ifr_name, name, IFNAMSIZ);
+      if ((err = ioctl(fd, TUNSETIFF, (void *) &ifr)) < 0 )
+	  goto tap_error;
+      if ((*ifname = driver_copy_string(ifr.ifr_name)) == NULL)
+	  goto tap_error;
+      return fd;
+#else
+      if (isdigit(name[3])) {  // tap<d> ?
+	  char devname[32];
+	  sprintf(devname, "/dev/%s", name);
+	  if ((fd = open(devname, O_RDWR)) < 0)
+	      return -1;
+	  DEBUGF("/dev/%s is opened for read and write", devname);
+	  if ((*ifname = driver_copy_string(name)) == NULL)
+	      goto tap_error;
+	  return fd;
+      }
+      else {
+	  int i;
+	  for (i = 0; i < 255; i++) {
+	      char devname[32];
+	      sprintf(devname, "/dev/tap%d", i);
+	      DEBUGF("try open device %s", devname);
+	      if ((fd = open(devname, O_RDWR)) >= 0) {
+		  DEBUGF("/dev/tap%d is opened for read and write", i);
+		  sprintf(devname, "tap%d", i);
+		  if ((*ifname = driver_copy_string(devname)) == NULL)
+		      goto tap_error;
+		  return fd;
+	      }
+	      else if (errno != EBUSY)
+		  return -1;
+	  }
+	  errno = ENOENT;
+	  return -1;
+      }
+#endif
     }
     else  {
 #if defined(__linux__)
@@ -350,6 +400,7 @@ static int open_device(int tap)
 #elif defined(__APPLE__)
 	int i;
 	for (i = 0; i < 255; i++) {
+	    char devname[32];
 	    sprintf(devname, "/dev/bpf%d", i);
 	    DEBUGF("try open device %s", devname);
 	    if ((fd = open(devname, O_RDWR)) >= 0) {
@@ -357,7 +408,7 @@ static int open_device(int tap)
 		return fd;
 	    }
 	    else if (errno != EBUSY)
-	    return -1;
+		return -1;
     }
     errno = ENOENT;
     return -1;
@@ -366,6 +417,13 @@ static int open_device(int tap)
     return -1;
 #endif
     }
+
+tap_error: {
+	int save_errno = errno;
+	close(fd);
+	errno = save_errno;
+    }
+    return -1;	      
 }
 //
 // attach socket to interface
@@ -408,7 +466,7 @@ static int setup_input_buffer(eth_ctx_t* ctx)
     u_int immediate = 1;
     u_int buflen = 32*1024;
 
-    if (ctx->tap < 0) {
+    if (!ctx->is_tap) {
 	while(buflen > 0) {
 	    if (ioctl(INT_EVENT(ctx->fd), BIOCSBLEN, &buflen) >= 0)
 		break;
@@ -435,7 +493,7 @@ static int setup_input_buffer(eth_ctx_t* ctx)
 static int alloc_input_buffer(eth_ctx_t* ctx)
 {
     uint buflen;
-    if (ctx->tap >= 0)
+    if (ctx->is_tap)
 	buflen = ctx->ibuflen;
     else {
 #if defined(__APPLE__)
@@ -473,10 +531,18 @@ static int set_bpf(eth_ctx_t* ctx, uint8_t* buf, int len)
     }
     fcode.len = n;
     fcode.filter = insns;
-    if (setsockopt(INT_EVENT(ctx->fd), SOL_SOCKET, SO_ATTACH_FILTER,
-		   &fcode, sizeof(fcode)) == -1) {
-        DEBUGF("setsockopt error=%s", strerror(errno));
-        return -1;
+    if (ctx->is_tap) {
+	if (ioctl(INT_EVENT(ctx->fd), TUNATTACHFILTER, &fcode) == -1) {
+	    DEBUGF("ioctl attach filter error=%s", strerror(errno));
+	    return -1;
+	}
+    }
+    else {
+	if (setsockopt(INT_EVENT(ctx->fd), SOL_SOCKET, SO_ATTACH_FILTER,
+		       &fcode, sizeof(fcode)) == -1) {
+	    DEBUGF("setsockopt error=%s", strerror(errno));
+	    return -1;
+	}
     }
     return 0;
 #elif defined(__APPLE__)
@@ -496,7 +562,7 @@ static int set_bpf(eth_ctx_t* ctx, uint8_t* buf, int len)
     }
     prog.bf_len = n;
     prog.bf_insns = insns;
-    if (ctx->tap < 0) {
+    if (!ctx->is_tap) {
 	if (ioctl(INT_EVENT(ctx->fd), BIOCSETF, &prog) < 0) {
 	    ERRORF("ioctl BIOCSETF %s", strerror(errno));
 	    return -1;
@@ -555,7 +621,7 @@ static int bind_interface(eth_ctx_t* ctx)
 
 static int unbind_interface(eth_ctx_t* ctx)
 {
-    if (ctx->tap >=0) 
+    if (ctx->is_tap) 
 	return 0;
     else {
 #if defined(__linux__)
@@ -581,7 +647,7 @@ static int unbind_interface(eth_ctx_t* ctx)
 static int get_bpf_stat(eth_ctx_t* ctx, uint32_t stat[2])
 {
     stat[0] = stat[1] = 0;
-    if (ctx->tap < 0) {
+    if (!ctx->is_tap) {
 #if defined(__APPLE__)
 	struct bpf_stat bst;
 	if (ioctl(INT_EVENT(ctx->fd),  BIOCGSTATS, &bst) < 0)
@@ -657,7 +723,7 @@ static int deliver_frame(eth_ctx_t* ctx, uint8_t* p, uint32_t len)
 
 static int input_frame(eth_ctx_t* ctx)
 {
-    if (ctx->tap >= 0) {
+    if (ctx->is_tap) {
 	int n;
 	if ((n = read(INT_EVENT(ctx->fd), ctx->ibuf, ctx->ibuflen)) > 0)
 	    deliver_frame(ctx, ctx->ibuf, n);
@@ -736,30 +802,31 @@ static ErlDrvData eth_drv_start(ErlDrvPort port, char* command)
 {
     eth_ctx_t* ctx;
     int fd;
-    int tap = -1;
+    int is_tap = 0;
 
     DEBUGF("eth_drv_start: command %s", command);
 
-    if (strncmp(command+8, "tap", 3) == 0)
-	tap = atoi(command+11);
-    
-    if ((fd = open_device(tap)) < 0)
-	return ERL_DRV_ERROR_ERRNO;
-
     if ((ctx = (eth_ctx_t*) 
 	 driver_alloc(sizeof(eth_ctx_t))) == NULL) {
-	close(fd);
 	errno = ENOMEM;
 	return ERL_DRV_ERROR_ERRNO;
     }
     memset(ctx, 0, sizeof(eth_ctx_t));
+
+    if (strcmp(command+8, "tap") == 0)
+	is_tap = 1;
+    if ((fd = open_device(is_tap, command+8, &ctx->if_name)) < 0) {
+	driver_free(ctx);
+	return ERL_DRV_ERROR_ERRNO;
+    }
+
     DEBUGF("eth_drv: start (%s) fd=%d", command, fd);
 
     ctx->port         = port;
     ctx->dport        = driver_mk_port(port);
     ctx->owner        = driver_connected(port);
     ctx->fd           = (ErlDrvEvent)((long)fd);
-    ctx->tap          = tap;
+    ctx->is_tap       = is_tap;
     ctx->if_index     = -1;
 
     if (setup_input_buffer(ctx) < 0) {
@@ -802,7 +869,7 @@ static ErlDrvSSizeT eth_drv_ctl(ErlDrvData d,
     switch(cmd) {
     case CMD_BIND:
 	if (len == 0) goto badarg;
-	if (ctx->tap < 0) {
+	if (!ctx->is_tap) {
 	    if ((ctx->if_index = get_ifindex(INT_EVENT(ctx->fd), buf, len)) < 0)
 		goto error;
 	    ctx->if_name = driver_alloc(len+1);
@@ -813,7 +880,7 @@ static ErlDrvSSizeT eth_drv_ctl(ErlDrvData d,
 	}
 	if (alloc_input_buffer(ctx) < 0)
 	    goto error;
-	goto ok;
+	return ctl_reply(5, ctx->if_name, strlen(ctx->if_name), rbuf, rsize);
 
     case CMD_UNBIND:
 	if (len != 0) goto badarg;
@@ -925,6 +992,11 @@ static ErlDrvSSizeT eth_drv_ctl(ErlDrvData d,
 	if (get_bpf_stat(ctx, stat) < 0)
 	    goto error;
 	return ctl_reply(sizeof(stat), (char*)stat, sizeof(stat), rbuf, rsize);
+    }
+
+    case CMD_GET_NAME: {
+	if (len != 0) goto badarg;
+	return ctl_reply(5, ctx->if_name, strlen(ctx->if_name), rbuf, rsize);
     }
 
     case CMD_DEBUG: {

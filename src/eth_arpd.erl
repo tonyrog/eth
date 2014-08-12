@@ -73,12 +73,13 @@ init([Interface]) ->
 	    Filter = bpf:asm(FilterProg),
 	    _Reply0 = eth:set_filter(Port, Filter),
 	    _Reply1 = eth:set_active(Port, -1),
-	    Mac = get_mac_address(Interface),
-	    %% io:format("set mac address: ~s to ~w\n", [Interface,Mac]),
-	    {ok, #state { name = Interface,
+	    {ok,Name} = eth_devices:get_name(Port), %% pic up potential tun<n>
+	    Mac = get_mac_address(Name),
+	    io:format("set mac address: ~s to ~w\n", [Name,Mac]),
+	    {ok, #state { name = Name,
 			  eth = Port,
 			  mac = Mac, 
-			  ipmac = dics:new(),
+			  ipmac = dict:new(),
 			  cache = dict:new()
 			}};
 	Error ->
