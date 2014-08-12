@@ -69,7 +69,8 @@ typedef struct _eth_ctx_t
 {
     ErlDrvPort  port;
     ErlDrvEvent fd;
-    ErlDrvTermData owner;         // port owner
+    int         tap;           // tap number or -1 if bpf/packet device
+    ErlDrvTermData owner;      // port owner
     char*       if_name;       // interface name
     int         if_index;      // interface index
     int         is_selecting;  // driver select in use
@@ -326,22 +327,34 @@ static eth_sub_t** find_or_create_sub(eth_ctx_t* ctx, ErlDrvTermData pid)
 }
 
 
-static int open_device()
+static int open_device(int tap)
 {
-#if defined(__linux__)
-    // could select ETH_P_ARP/ETH_P_8021Q ...
-    return socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
-#elif defined(__APPLE__)
-    int i;
-    for (i = 0; i < 255; i++) {
-	int fd;
-	char bpfname[32];
-	sprintf(bpfname, "/dev/bpf%d", i);
-	if ((fd = open(bpfname, O_RDWR)) >= 0) {
-	    DEBUGF("/dev/bpf%d is opened for read and write", i);
+    int  i,fd;
+    char devname[32];
+
+    if (tap >= 0) {
+	sprintf(devname, "/dev/tap%d", tap);
+	DEBUGF("try open device %s", devname);
+	if ((fd = open(devname, O_RDWR)) >= 0) {
+	    DEBUGF("/dev/tap%d is opened for read and write", tap);
 	    return fd;
 	}
-	else if (errno != EBUSY)
+	return -1;
+    }
+    else  {
+#if defined(__linux__)
+	DEBUGF("try open packet socket");
+	// could select ETH_P_ARP/ETH_P_8021Q ...
+	return socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
+#elif defined(__APPLE__)
+	for (i = 0; i < 255; i++) {
+	    sprintf(devname, "/dev/bpf%d", i);
+	    DEBUGF("try open device %s", devname);
+	    if ((fd = open(devname, O_RDWR)) >= 0) {
+		DEBUGF("/dev/bpf%d is opened for read and write", i);
+		return fd;
+	    }
+	    else if (errno != EBUSY)
 	    return -1;
     }
     errno = ENOENT;
@@ -350,6 +363,7 @@ static int open_device()
     errno = ENOENT;
     return -1;
 #endif
+    }
 }
 //
 // attach socket to interface
@@ -392,19 +406,21 @@ static int setup_input_buffer(eth_ctx_t* ctx)
     u_int immediate = 1;
     u_int buflen = 32*1024;
 
-    while(buflen > 0) {
-	if (ioctl(INT_EVENT(ctx->fd), BIOCSBLEN, &buflen) >= 0)
-	    break;
-	if (errno != ENOBUFS) {
-	    ERRORF("ioctl BIOCSBLEN %s", strerror(errno));
+    if (ctx->tap < 0) {
+	while(buflen > 0) {
+	    if (ioctl(INT_EVENT(ctx->fd), BIOCSBLEN, &buflen) >= 0)
+		break;
+	    if (errno != ENOBUFS) {
+		ERRORF("ioctl BIOCSBLEN %s", strerror(errno));
+		return -1;
+	    }
+	    buflen >>= 1;
+	}
+	DEBUGF("buflen used = %d", buflen);
+	if (ioctl(INT_EVENT(ctx->fd), BIOCIMMEDIATE, &immediate) < 0) {
+	    ERRORF("ioctl BIOCIMMEDIATE %s", strerror(errno));
 	    return -1;
 	}
-	buflen >>= 1;
-    }
-    DEBUGF("buflen used = %d", buflen);
-    if (ioctl(INT_EVENT(ctx->fd), BIOCIMMEDIATE, &immediate) < 0) {
-	ERRORF("ioctl BIOCIMMEDIATE %s", strerror(errno));
-	return -1;
     }
     ctx->ibuf    = NULL;
     ctx->ibuflen = buflen;
@@ -417,14 +433,18 @@ static int setup_input_buffer(eth_ctx_t* ctx)
 static int alloc_input_buffer(eth_ctx_t* ctx)
 {
     uint buflen;
+    if (ctx->tap >= 0)
+	buflen = ctx->ibuflen;
+    else {
 #if defined(__APPLE__)
-    if (ioctl(INT_EVENT(ctx->fd), BIOCGBLEN, &buflen) < 0) {
-	ERRORF("ioctl BIOCGBLEN %s", strerror(errno));
-	return -1;
-    }
+	if (ioctl(INT_EVENT(ctx->fd), BIOCGBLEN, &buflen) < 0) {
+	    ERRORF("ioctl BIOCGBLEN %s", strerror(errno));
+	    return -1;
+	}
 #else
-    buflen = ctx->ibuflen;
+	buflen = ctx->ibuflen;
 #endif
+    }
     DEBUGF("alloc_input_buffer: size=%d", buflen);
     ctx->ibuf = driver_alloc(buflen);
     ctx->ibuflen = buflen;
@@ -474,9 +494,11 @@ static int set_bpf(eth_ctx_t* ctx, uint8_t* buf, int len)
     }
     prog.bf_len = n;
     prog.bf_insns = insns;
-    if (ioctl(INT_EVENT(ctx->fd), BIOCSETF, &prog) < 0) {
-	ERRORF("ioctl BIOCSETF %s", strerror(errno));
-	return -1;
+    if (ctx->tap < 0) {
+	if (ioctl(INT_EVENT(ctx->fd), BIOCSETF, &prog) < 0) {
+	    ERRORF("ioctl BIOCSETF %s", strerror(errno));
+	    return -1;
+	}
     }
     return 0;
 #else
@@ -531,56 +553,43 @@ static int bind_interface(eth_ctx_t* ctx)
 
 static int unbind_interface(eth_ctx_t* ctx)
 {
+    if (ctx->tap >=0) 
+	return 0;
+    else {
 #if defined(__linux__)
-    struct packet_mreq mr;
-    socklen_t mrlen = sizeof(mr);
-    mr.mr_ifindex = ctx->if_index;
-    mr.mr_type    = PACKET_MR_PROMISC;
-    if (setsockopt(INT_EVENT(ctx->fd), SOL_PACKET, PACKET_DROP_MEMBERSHIP, 
-		   &mr, mrlen) < 0) {
-	ERRORF("setsockopt PACKET_DROP_MEMBERSHIP error=%s", strerror(errno));
-	return -1;
-    }
-    return 0;
+	struct packet_mreq mr;
+	socklen_t mrlen = sizeof(mr);
+	mr.mr_ifindex = ctx->if_index;
+	mr.mr_type    = PACKET_MR_PROMISC;
+	if (setsockopt(INT_EVENT(ctx->fd), SOL_PACKET, PACKET_DROP_MEMBERSHIP, 
+		       &mr, mrlen) < 0) {
+	    ERRORF("setsockopt PACKET_DROP_MEMBERSHIP error=%s", strerror(errno));
+	    return -1;
+	}
+	return 0;
 #elif defined(__APPLE__)
-    // not possible with bpf ? (nor needed?)
-    return 0;
+	// not possible with bpf ? (nor needed?)
+	return 0;
 #else
-    return -1;
+	return -1;
 #endif
+    }
 }
 
 static int get_bpf_stat(eth_ctx_t* ctx, uint32_t stat[2])
 {
+    stat[0] = stat[0] = 0;
+    if (ctx->tap < 0) {
 #if defined(__APPLE__)
-    struct bpf_stat bst;
-
-    if (ioctl(INT_EVENT(ctx->fd),  BIOCGSTATS, &bst) < 0)
-	return -1;
-    stat[0] = bst.bs_recv;
-    stat[1] = bst.bs_drop;
+	struct bpf_stat bst;
+	if (ioctl(INT_EVENT(ctx->fd),  BIOCGSTATS, &bst) < 0)
+	    return -1;
+	stat[0] = bst.bs_recv;
+	stat[1] = bst.bs_drop;
+#endif
+    }
     return 0;
-#else
-    return -1;
-#endif
 }
-//
-// Send an ARP_PACKET
-//
-#if 0 
-static void make_arp_packet(eth_ctx_t* ctx)
-{
-    const uint8_t ether_broadcast_addr[] = {0xff,0xff,0xff,0xff,0xff,0xff};
-    struct sockaddr_ll addr = {0};
-
-    addr.sll_family   = AF_PACKET;
-    addr.sll_protocol = htons(ETH_P_ARP);
-    addr.sll_ifindex  = ctx->if_index;
-    addr.sll_halen    = ETHER_ADDR_LEN;
-
-    memcpy(addr.sll_addr, ether_broadcast_addr, ETHER_ADDR_LEN);
-}
-#endif
 
 static int deliver_active(eth_ctx_t* ctx, ErlDrvTermData pid, int is_active)
 {
@@ -646,47 +655,56 @@ static int deliver_frame(eth_ctx_t* ctx, uint8_t* p, uint32_t len)
 
 static int input_frame(eth_ctx_t* ctx)
 {
-#if defined(__linux__)
-    int saddr_size;
-    struct sockaddr saddr;
-    int n;
-    //if ((n = read(INT_EVENT(ctx->fd), ctx->ibuf, ctx->ibuflen)) > 0) {
-    // check if recvfrom deliver correct length for arp packets
-    if ((n = recvfrom(INT_EVENT(ctx->fd), ctx->ibuf, ctx->ibuflen,
-		      0, &saddr, (socklen_t*)&saddr_size)) > 0) {
-	deliver_frame(ctx, ctx->ibuf, n);
-    }
-    else if (n < 0) {
-	DEBUGF("input_frame recvfrom failed %s", strerror(errno));
-    }
-    return n;
-#elif defined(__APPLE__)
-    int n;
-    if ((n = read(INT_EVENT(ctx->fd), ctx->ibuf, ctx->ibuflen)) > 0) {
-	char* ptr = (char*) ctx->ibuf;
-	char* ptr_end = ptr + n;
-	while (ptr < ptr_end) {
-	    struct bpf_hdr* p = (struct bpf_hdr*)  ptr;
-	    char* data = ptr + p->bh_hdrlen;
-
-	    DEBUGF("input_frame %d bytes of %d remain=%d n=%d",
-		   p->bh_caplen, p->bh_datalen,
-		   ptr_end - data, n);
-	    
-	    if ((p->bh_caplen == p->bh_datalen) &&
-		(data+p->bh_caplen <= ptr_end)) {
-		deliver_frame(ctx, (uint8_t*)data, p->bh_caplen);
-	    }
-	    ptr += BPF_WORDALIGN(p->bh_hdrlen + p->bh_caplen);
+    if (ctx->tap >= 0) {
+	int n;
+	if ((n = read(INT_EVENT(ctx->fd), ctx->ibuf, ctx->ibuflen)) > 0)
+	    deliver_frame(ctx, ctx->ibuf, n);
+	else if (n < 0) {
+	    DEBUGF("input_frame recvfrom failed %s", strerror(errno));
 	}
+	return n;
     }
-    else if (n < 0) {
-	DEBUGF("input_frame read failed %s", strerror(errno));
-    }
-    return n;
+    else {
+#if defined(__linux__)
+	int saddr_size;
+	struct sockaddr saddr;
+	int n;
+	if ((n = recvfrom(INT_EVENT(ctx->fd), ctx->ibuf, ctx->ibuflen,
+			  0, &saddr, (socklen_t*)&saddr_size)) > 0) {
+	    deliver_frame(ctx, ctx->ibuf, n);
+	}
+	else if (n < 0) {
+	    DEBUGF("input_frame recvfrom failed %s", strerror(errno));
+	}
+	return n;
+#elif defined(__APPLE__)
+	int n;
+	if ((n = read(INT_EVENT(ctx->fd), ctx->ibuf, ctx->ibuflen)) > 0) {
+	    char* ptr = (char*) ctx->ibuf;
+	    char* ptr_end = ptr + n;
+	    while (ptr < ptr_end) {
+		struct bpf_hdr* p = (struct bpf_hdr*)  ptr;
+		char* data = ptr + p->bh_hdrlen;
+		
+		DEBUGF("input_frame %d bytes of %d remain=%d n=%d",
+		       p->bh_caplen, p->bh_datalen,
+		       ptr_end - data, n);
+		
+		if ((p->bh_caplen == p->bh_datalen) &&
+		    (data+p->bh_caplen <= ptr_end)) {
+		    deliver_frame(ctx, (uint8_t*)data, p->bh_caplen);
+		}
+		ptr += BPF_WORDALIGN(p->bh_hdrlen + p->bh_caplen);
+	    }
+	}
+	else if (n < 0) {
+	    DEBUGF("input_frame read failed %s", strerror(errno));
+	}
+	return n;
 #else
-    return -1;
+	return -1;
 #endif
+    }
 }
 
 // setup global object area
@@ -711,13 +729,19 @@ static void eth_drv_finish(void)
 {
 }
 
+// command is something like "eth_drv eth0" or "eth_drv tap1" etc
 static ErlDrvData eth_drv_start(ErlDrvPort port, char* command)
 {
-    (void) command;
     eth_ctx_t* ctx;
     int fd;
+    int tap = -1;
 
-    if ((fd = open_device()) < 0)
+    DEBUGF("eth_drv_start: command %s", command);
+
+    if (strncmp(command+8, "tap", 3) == 0)
+	tap = atoi(command+11);
+    
+    if ((fd = open_device(tap)) < 0)
 	return ERL_DRV_ERROR_ERRNO;
 
     if ((ctx = (eth_ctx_t*) 
@@ -733,6 +757,7 @@ static ErlDrvData eth_drv_start(ErlDrvPort port, char* command)
     ctx->dport        = driver_mk_port(port);
     ctx->owner        = driver_connected(port);
     ctx->fd           = (ErlDrvEvent)((long)fd);
+    ctx->tap          = tap;
     ctx->if_index     = -1;
 
     if (setup_input_buffer(ctx) < 0) {
@@ -775,13 +800,15 @@ static ErlDrvSSizeT eth_drv_ctl(ErlDrvData d,
     switch(cmd) {
     case CMD_BIND:
 	if (len == 0) goto badarg;
-	if ((ctx->if_index = get_ifindex(INT_EVENT(ctx->fd), buf, len)) < 0)
-	    goto error;
-	ctx->if_name = driver_alloc(len+1);
-	memcpy(ctx->if_name, buf, len);
-	ctx->if_name[len] = '\0';
-	if (bind_interface(ctx) < 0)
-	    goto error;
+	if (ctx->tap < 0) {
+	    if ((ctx->if_index = get_ifindex(INT_EVENT(ctx->fd), buf, len)) < 0)
+		goto error;
+	    ctx->if_name = driver_alloc(len+1);
+	    memcpy(ctx->if_name, buf, len);
+	    ctx->if_name[len] = '\0';
+	    if (bind_interface(ctx) < 0)
+		goto error;
+	}
 	if (alloc_input_buffer(ctx) < 0)
 	    goto error;
 	goto ok;

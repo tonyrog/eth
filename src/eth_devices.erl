@@ -86,25 +86,25 @@ start_link() ->
 %%
 %% Try open an interface 
 %%
-open(Interface) ->
+open(Interface) when is_list(Interface) ->
     gen_server:call(?SERVER, {open, Interface}).
 
 %%
 %% Close an open interface
 %%
-close(Interface) ->
+close(Interface) when is_list(Interface) ->
     gen_server:call(?SERVER, {close, Interface}).
 
 %%
 %% Find port for an interface
 %%
-find(Interface) ->
+find(Interface) when is_list(Interface) ->
     gen_server:call(?SERVER, {find, Interface}).
 
 %% @doc
 %%   Get the hardware of an interface
 %% @end
-get_address(Interface) ->
+get_address(Interface) when is_list(Interface) ->
     gen_server:call(?SERVER, {get_address, Interface}). 
 
 %% @doc
@@ -205,7 +205,7 @@ pid_get_stat(Port) when is_port(Port) ->
 init([]) ->
     Driver = "eth_drv",
     ok = erl_ddll:load_driver(code:priv_dir(eth), Driver),
-    {ok,IFs} = inet:getifaddrs(),
+    IFs = get_if_addr_list(),
     %% fixme: subscriber to netlink events, when interfaces are
     %% added and removed!
     Ds = [#device { name=Name,
@@ -242,7 +242,7 @@ handle_call({open,Name}, _From, State) ->
 	    if is_port(D#device.port) ->
 		    {reply, {ok,D#device.port}, State};
 	       true ->
-		    Driver = "eth_drv",
+		    Driver = "eth_drv "++Name,
 		    try erlang:open_port({spawn_driver, Driver},[binary]) of
 			Port ->
 			    case port_call(Port, ?CMD_BIND, Name) of
@@ -476,3 +476,10 @@ level(critical) -> ?DLOG_CRITICAL;
 level(alert) -> ?DLOG_ALERT;
 level(emergency) -> ?DLOG_EMERGENCY;
 level(none) -> ?DLOG_NONE.
+
+%% get all known interfaces and the addresses
+
+get_if_addr_list() ->
+    {ok,IFs} = inet:getifaddrs(),
+    %% add tap interfaces tap0..tap9
+    IFs ++ [{"tap"++[N],[]} || N <- lists:seq($0,$9)].
