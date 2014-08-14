@@ -69,7 +69,9 @@ query_mac(Arpd, IP) ->
 init([Interface]) ->
     case eth_devices:open(Interface) of
 	{ok,Port} ->
-	    FilterProg = eth_bpf:build_programx("ether.type.arp"),
+	    FilterProg = eth_bpf:build_programx(
+			   {'||', "ether.type.arp",
+			    {'&&', "ether.type.ip","ip.proto.icmp"}}),
 	    Filter = bpf:asm(FilterProg),
 	    _Reply0 = eth:set_filter(Port, Filter),
 	    _Reply1 = eth:set_active(Port, -1),
@@ -107,7 +109,7 @@ handle_call({add_ip,IP,Mac}, _From, State) ->
 		      tuple_size(IP) =:= 8 -> {ipv6, 16}
 		   end,
     send_arp(?BROADCAST,State#state.mac,
-	     #arp { op=request, %% or reply ?
+	     #arp { op=reply, %% or request ?
 		    htype = ethernet,
 		    ptype = PType,
 		    haddrlen = 6,
@@ -159,7 +161,7 @@ handle_cast(_Msg, State) ->
 handle_info({eth_frame,_Port,_IfIndex,Data}, State) ->
     try eth_packet:decode(Data, [{decode_types,all},nolookup]) of
 	Eth ->
-	    State1 = insert_frame(Eth, State),
+	    State1 = handle_frame(Eth, State),
 	    {noreply, State1}
     catch
 	error:Reason ->
@@ -181,11 +183,66 @@ code_change(_OldVsn, State, _Extra) ->
 %%% Internal functions
 %%%===================================================================
 
-insert_frame(#eth { src=Src,dst=Dst,data = Arp = #arp {}}, State) ->
-    insert_arp(Arp,Src,Dst,State);
-insert_frame(_Frame, State) ->
-    ?dbg("insert_frame: ~p\n", [_Frame]),
+handle_frame(Eth=#eth { data = Arp = #arp {}}, State) ->
+    handle_arp(Arp,Eth,State);
+handle_frame(Eth=#eth { data = IP = #ipv4 {}}, State) ->
+    handle_ipv4(IP,Eth,State);
+handle_frame(_Frame, State) ->
+    ?dbg("handle_frame: not handled: ~p\n", [_Frame]),
     State.
+
+handle_ipv4(Ip=#ipv4 { data = Icmp = #icmp{} }, Eth, State) ->
+    case dict:find(Ip#ipv4.dst, State#state.ipmac) of
+	error -> %% host not found?
+	    State;  %% just ignore right now
+	{ok,_Mac} ->
+	    handle_icmp(Icmp, Ip, Eth, State)
+    end;
+handle_ipv4(_Ip, _Eth, State) ->
+    ?dbg("handle_ipv4: not handled: ~p\n", [_Ip]),
+    State.
+
+handle_icmp(#icmp { type=echo_request,id=ID,seq=Seq,data=Data},Ip,Eth,State) ->
+    Icmp1 = #icmp { type=echo_reply, id=ID, seq=Seq, data=Data},
+    Ip1  = #ipv4 { src=Ip#ipv4.dst, dst=Ip#ipv4.src, proto=icmp, data=Icmp1 },
+    Eth1 = #eth { src=Eth#eth.dst, dst=Eth#eth.src, type=ipv4, data=Ip1},
+    send_frame(Eth1, State).
+
+%% respon or cache arp entries
+handle_arp(_Arp=#arp { op = reply,
+		       sender = {SenderMac, SenderIp},
+		       target = {TargetMac, TargetIp}},_Eth,State) ->
+    ?dbg("cache arp: ~p\n", [_Arp]),
+    %% cache only on reply and gratuitous arp?
+    State1 = insert_cache(SenderIp, SenderMac, State),
+    State2 = insert_cache(TargetIp, TargetMac, State1),
+    State2;
+handle_arp(Arp=#arp { op = request,
+		      sender = {SenderMac, SenderIp},
+		      target = {?ZERO, TargetIp}},Eth,State) ->
+    ?dbg("handle arp request: ~p\n", [Arp]),
+    case dict:find(TargetIp, State#state.ipmac) of
+	error ->
+	    State;
+	{ok,TargetMac} ->
+	    ?dbg("handle arp reply with mac=~w\n", [TargetMac]),
+	    send_arp(Eth#eth.src,Eth#eth.dst,
+		     Arp#arp { op=reply,
+			       sender={TargetMac,TargetIp},
+			       target={SenderMac,SenderIp}}, State),
+	    State
+    end;
+handle_arp(Arp,_Eth,State) ->
+    ?dbg("handle_arp: not handled: ~p\n", [Arp]),
+    State.
+
+send_arp(Dst,Src,Arp,State) ->
+    Frame=#eth { src=Src, dst=Dst, type=arp, data=Arp},
+    send_frame(Frame, State).
+
+send_frame(Frame, State) ->
+    Data=enet_eth:encode(Frame, []),
+    eth_devices:send(State#state.eth, Data).
 
 
 get_mac_address(Interface) ->
@@ -194,40 +251,6 @@ get_mac_address(Interface) ->
 	false -> undefined;
 	{_,Fs} -> list_to_tuple(proplists:get_value(hwaddr,Fs))
     end.
-
-%% respon or cache arp entries
-insert_arp(_Arp=#arp { op = reply,
-		       sender = {SenderMac, SenderIp},
-		       target = {TargetMac, TargetIp}},_Src,_Dst,State) ->
-    ?dbg("cache arp: ~p\n", [_Arp]),
-    %% cache only on reply and gratuitous arp?
-    State1 = insert_cache(SenderIp, SenderMac, State),
-    State2 = insert_cache(TargetIp, TargetMac, State1),
-    State2;
-insert_arp(Arp=#arp { op = request,
-		      sender = {SenderMac, SenderIp},
-		      target = {?ZERO, TargetIp}},Src,Dst,State) ->
-    ?dbg("handle arp request: ~p\n", [Arp]),
-    case dict:find(TargetIp, State#state.ipmac) of
-	error ->
-	    State;
-	{ok,TargetMac} ->
-	    ?dbg("handle arp reply with mac=~w\n", [TargetMac]),
-	    send_arp(Src,Dst,
-		     Arp#arp { op=reply,
-			       sender={TargetMac,TargetIp},
-			       target={SenderMac,SenderIp}}, State),
-	    State
-    end;
-insert_arp(Arp,_Src,_Dst,State) ->
-    ?dbg("ignore arp request: ~p\n", [Arp]),
-    State.
-
-
-send_arp(Dst,Src,Arp,State) ->
-    Frame=#eth { src=Src, dst=Dst, type=arp, data=Arp},
-    Data=enet_eth:encode(Frame, []),
-    eth_devices:send(State#state.eth, Data).
 
 
 %% build for 
