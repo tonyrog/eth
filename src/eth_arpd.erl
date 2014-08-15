@@ -19,6 +19,7 @@
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
 	 terminate/2, code_change/3]).
 
+-export([test/0]).
 
 -define(dbg(F,A), io:format((F),(A))).
 %% -define(dbg(F,A), ok).
@@ -33,13 +34,20 @@
 	  name :: string(),  %% name of interface (like "tap0", "en1", "eth0")
 	  eth,       %% interface handler
 	  mac :: ethernet_address(),       %% the mac address on interface
-	  ipmac :: sets:set(ip_address()), %% handled address pairs
+	  ipmac :: dict:dict(ip_address(),ethernet_address()),
+	  macs :: sets:set(ethernet_address()),
 	  cache :: dict:dict(ip_address(),ethernet_address())
 	 }).
 
 %%%===================================================================
 %%% API
 %%%===================================================================
+
+test() ->  %% run as root!
+    {ok,A} = start("tap"),
+    "" = os:cmd("ifconfig tap0 192.168.10.1 up"),
+    add_ip(A, {192,168,10,10}, {1,2,3,4,5,6}),
+    {ok,A}.
 
 start(Interface) ->
     application:ensure_all_started(eth),
@@ -82,6 +90,7 @@ init([Interface]) ->
 			  eth = Port,
 			  mac = Mac, 
 			  ipmac = dict:new(),
+			  macs = sets:new(),
 			  cache = dict:new()
 			}};
 	Error ->
@@ -104,6 +113,7 @@ init([Interface]) ->
 %%--------------------------------------------------------------------
 handle_call({add_ip,IP,Mac}, _From, State) ->
     IPMac = dict:store(IP, Mac, State#state.ipmac),
+    Macs = sets:add_element(Mac, State#state.macs),
     %% inform network about this fact, gratuitous ARP
     {PType,PLen} = if tuple_size(IP) =:= 4 -> {ipv4, 4};
 		      tuple_size(IP) =:= 8 -> {ipv6, 16}
@@ -116,9 +126,10 @@ handle_call({add_ip,IP,Mac}, _From, State) ->
 		    paddrlen = PLen,
 		    sender={Mac,IP},
 		    target={?BROADCAST,IP}}, State),
-    {reply, ok, State#state { ipmac = IPMac }};
+    {reply, ok, State#state { ipmac = IPMac, macs = Macs }};
 handle_call({del_ip,IP}, _From, State) ->
     IPMac = dict:erase(IP, State#state.ipmac),
+    %% fixme delete mac from macs set when all {ip,mac} pairs are gone
     {reply, ok, State#state { ipmac = IPMac }};
 handle_call({find_mac,IP}, _From, State) ->
     case dict:find(IP, State#state.cache) of
@@ -206,7 +217,12 @@ handle_icmp(#icmp { type=echo_request,id=ID,seq=Seq,data=Data},Ip,Eth,State) ->
     Icmp1 = #icmp { type=echo_reply, id=ID, seq=Seq, data=Data},
     Ip1  = #ipv4 { src=Ip#ipv4.dst, dst=Ip#ipv4.src, proto=icmp, data=Icmp1 },
     Eth1 = #eth { src=Eth#eth.dst, dst=Eth#eth.src, type=ipv4, data=Ip1},
-    send_frame(Eth1, State).
+    send_frame(Eth1, State),
+    State;
+handle_icmp(_Icmp,_Ip,_Eth,State) ->
+    ?dbg("handle_icmp: not handled: ~p\n", [_Icmp]),
+    State.
+
 
 %% respon or cache arp entries
 handle_arp(_Arp=#arp { op = reply,
@@ -219,17 +235,23 @@ handle_arp(_Arp=#arp { op = reply,
     State2;
 handle_arp(Arp=#arp { op = request,
 		      sender = {SenderMac, SenderIp},
-		      target = {?ZERO, TargetIp}},Eth,State) ->
+		      target = {TargetMac, TargetIp}},Eth,State) ->
     ?dbg("handle arp request: ~p\n", [Arp]),
-    case dict:find(TargetIp, State#state.ipmac) of
-	error ->
-	    State;
-	{ok,TargetMac} ->
-	    ?dbg("handle arp reply with mac=~w\n", [TargetMac]),
-	    send_arp(Eth#eth.src,Eth#eth.dst,
-		     Arp#arp { op=reply,
-			       sender={TargetMac,TargetIp},
-			       target={SenderMac,SenderIp}}, State),
+    case (TargetMac =:= ?ZERO) orelse
+	sets:is_element(TargetMac,State#state.macs) of
+	true ->
+	    case dict:find(TargetIp, State#state.ipmac) of
+		error ->
+		    State;
+		{ok,_TargetMac} ->
+		    ?dbg("handle arp reply with mac=~w\n", [TargetMac]),
+		    send_arp(Eth#eth.src,Eth#eth.dst,
+			     Arp#arp { op=reply,
+				       sender={TargetMac,TargetIp},
+				       target={SenderMac,SenderIp}}, State),
+		    State
+	    end;
+	false ->
 	    State
     end;
 handle_arp(Arp,_Eth,State) ->

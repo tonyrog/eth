@@ -869,7 +869,11 @@ static ErlDrvSSizeT eth_drv_ctl(ErlDrvData d,
     switch(cmd) {
     case CMD_BIND:
 	if (len == 0) goto badarg;
-	if (!ctx->is_tap) {
+	if (ctx->is_tap) {
+	    // maybe lookup tap<n> device here?, but not right now
+	    ctx->if_index = 0;  // needed in order for select to work!
+	}
+	else {
 	    if ((ctx->if_index = get_ifindex(INT_EVENT(ctx->fd), buf, len)) < 0)
 		goto error;
 	    ctx->if_name = driver_alloc(len+1);
