@@ -25,7 +25,10 @@
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
 	 terminate/2, code_change/3]).
 
--export([test_udp/0, test_tcp/0]).
+-export([test_init/0]).
+-export([test_udp/1]).
+-export([test_tcp_accept/1]).
+-export([test_tcp_connect/1]).
 
 -define(dbg(F,A), io:format((F),(A))).
 %% -define(dbg(F,A), ok).
@@ -35,12 +38,38 @@
 -define(BROADCAST, {16#ff,16#ff,16#ff,16#ff,16#ff,16#ff}).
 -define(ZERO,      {16#00,16#00,16#00,16#00,16#00,16#00}).
 
+-define(TCP_HEADER_MIN_LEN,   20).
+-define(IPV4_HEADER_MIN_LEN,  20).
+-define(IPV6_HEADER_MIN_LEN,  40).
+-define(TCP_IPV4_HEADER_MIN_LEN, (?IPV4_HEADER_MIN_LEN+?TCP_HEADER_MIN_LEN)).
+-define(TCP_IPV6_HEADER_MIN_LEN, (?IPV6_HEADER_MIN_LEN+?TCP_HEADER_MIN_LEN)).
+
 -type socket_key() :: 
 	{ tcp, ip_address(), port_no() } | %% listen "socket"
 	{ tcp_a, ip_address(), port_no() } | %% acceptor (only in ref->key map)
 	{ tcp, ip_address(), port_no(), ip_address(), port_no() } |
 	{ udp, ip_address(), port_no(), ip_address(), port_no() } |
 	{ udp, ip_address(), port_no() }.
+
+-type tcp_state() ::
+	listen     | syn_rcvd  | syn_sent | established | 
+	fin_wait1  | fin_wait2 | closing  | timewait |
+	close_wait | last_ack  | closed.
+%%
+%% input stream window = wsize*(1<<wscale ) our own anounced input size
+%%
+%% output stream window = wsize*(1<<wscale) other sides input size
+%%                        as used for transmission
+
+-record(stream,
+	{
+	  wsize=65535,         %% current announced window size
+	  wscale=0 :: 0..14,   %% window scaling wsize*(1 << wscale)
+	  mss :: non_neg_integer(), %% maximum segment size used
+	  bytes = 0,                %% number bytes sent / received in window
+	  seq = 0 :: non_neg_integer(), %% current seqeuence number
+	  segs = []   %% unacked output segments / undelivered input segments
+	}).
 
 -record(socket,
 	{
@@ -52,32 +81,39 @@
 	  dst_port :: port_no(),
 	  proto    :: tcp | udp,
 	  owner    :: pid(),
-	  aqueue = [] :: [{reference(),pid()}],
-	  ack      :: non_neg_integer(),
-	  seq      :: non_neg_integer(),
-	  window   :: non_neg_integer()
+	  tcp_state = closed :: tcp_state(),
+	  aqueue = [] :: [{reference(),pid()}],  %% accept queue
+	  ostream :: #stream{},
+	  istream :: #stream{}
 	}).
 
 -record(state,
 	{
 	  name :: string(),  %% name of interface (like "tap0", "en1", "eth0")
 	  eth,       %% interface handler
+	  mtu,       %% mtu size of interface / minimum mtu usable
 	  mac :: ethernet_address(),       %% the mac address on interface
 	  ipmac :: dict:dict(ip_address(),ethernet_address()),
 	  macs :: sets:set(ethernet_address()),
 	  cache :: dict:dict(ip_address(),ethernet_address()),
 	  sockets :: dict:dict(socket_key(), #socket{}),
 	  sockref :: dict:dict(reference(), socket_key())
-	 }).
+	}).
+
+-define(u32(X), ((X)  band 16#ffffffff)).
+-define(seq_next(X), ?u32((X)+1)).
 
 %%%===================================================================
 %%% API
 %%%===================================================================
 
-test_udp() ->  %% run as root!
+test_init() ->   %% run as root!
     {ok,Net} = start("tap"),
     "" = os:cmd("ifconfig tap0 192.168.10.1 up"),
     add_ip(Net, {192,168,10,10}, {1,2,3,4,5,6}),
+    {ok,Net}.
+
+test_udp(Net) ->
     {ok,U} = udp_open(Net, {192,168,10,10}, 6666, []),
     test_udp_loop(Net, U).
 
@@ -102,14 +138,16 @@ test_udp_loop(Net, U) ->
 		
     end.
 
-test_tcp() ->  %% run as root!
-    {ok,Net} = start("tap"),
-    "" = os:cmd("ifconfig tap0 192.168.10.1 up"),
-    add_ip(Net, {192,168,10,10}, {1,2,3,4,5,6}),
+test_tcp_accept(Net) ->
     {ok,L} = tcp_listen(Net, {192,168,10,10}, 6667, []),
-    {ok,A} = tcp_accept(Net, L),
-    {L,A,Net}.
+    {ok,S} = tcp_accept(Net, L),
+    S.
 
+test_tcp_connect(Net) ->
+    query_mac(Net, {192,168,10,1}),
+    timer:sleep(100),
+    {ok,S} = tcp_connect(Net,{192,168,10,10},57563,{192,168,10,1},6668,[]),
+    S.
 
 
 start(Interface) ->
@@ -151,18 +189,18 @@ tcp_close(Net, TcpRef) ->
 
 %% other
 
-add_ip(Arpd, IP, Mac) when (tuple_size(IP) =:= 4 orelse tuple_size(IP) =:= 8) 
-			   andalso (tuple_size(Mac) =:= 6) ->
-    gen_server:call(Arpd, {add_ip,IP,Mac}).
+add_ip(Net, IP, Mac) when (tuple_size(IP) =:= 4 orelse tuple_size(IP) =:= 8) 
+			  andalso (tuple_size(Mac) =:= 6) ->
+    gen_server:call(Net, {add_ip,IP,Mac}).
 
-del_ip(Arpd, IP) when tuple_size(IP) =:= 4; tuple_size(IP) =:= 8 ->
-    gen_server:call(Arpd, {del_ip,IP}).
+del_ip(Net, IP) when tuple_size(IP) =:= 4; tuple_size(IP) =:= 8 ->
+    gen_server:call(Net, {del_ip,IP}).
 
-find_mac(Arpd, IP) when tuple_size(IP) =:= 4; tuple_size(IP) =:= 8 ->
-    gen_server:call(Arpd, {find_mac,IP}). 
+find_mac(Net, IP) when tuple_size(IP) =:= 4; tuple_size(IP) =:= 8 ->
+    gen_server:call(Net, {find_mac,IP}). 
 
-query_mac(Arpd, IP) ->
-    gen_server:call(Arpd, {query_mac,IP}).
+query_mac(Net, IP) ->
+    gen_server:call(Net, {query_mac,IP}).
 
 %% Callbacks
 
@@ -185,6 +223,8 @@ init([Interface]) ->
 	    {ok, #state { name = Name,
 			  eth = Port,
 			  mac = Mac, 
+			  %% fixme:read mtu from eth_devices / minimum mtu
+			  mtu = 1500, 
 			  ipmac = dict:new(),
 			  macs = sets:new(),
 			  cache = dict:new(),
@@ -255,10 +295,13 @@ handle_call({tcp_listen,Owner,SrcIP,SrcPort,_Options}, _From, State) ->
 		    {reply, {error, einval}, State};
 		{ok,SrcMac} ->
 		    Ref = erlang:monitor(process, Owner),
-		    Socket = #socket { ref=Ref, mac = SrcMac,
+		    Socket = #socket { ref=Ref,
+				       mac = SrcMac,
 				       src = SrcIP,
 				       src_port = SrcPort,
-				       proto = tcp, owner = Owner },
+				       proto = tcp, 
+				       tcp_state = listen,
+				       owner = Owner },
 		    Sockets = dict:store(Key, Socket, State#state.sockets),
 		    SockRef = dict:store(Ref, Key, State#state.sockref),
 		    State1 =  State#state { sockets=Sockets, sockref=SockRef},
@@ -277,7 +320,7 @@ handle_call({tcp_accept,LRef,Acceptor}, _From, State) ->
 	    Ref = erlang:monitor(process, Acceptor),
 	    Socket = dict:fetch(Key, State#state.sockets),
 	    AQueue = Socket#socket.aqueue ++ [{Ref,Acceptor}],
-	    Socket1 = Socket#socket { aqueue = AQueue},
+	    Socket1 = Socket#socket { aqueue = AQueue },
 	    Sockets = dict:store(Key, Socket1, State#state.sockets),
 	    SockRef = dict:store(Ref, AKey, State#state.sockref),
 	    State1 = State#state { sockets=Sockets, sockref=SockRef },
@@ -297,17 +340,28 @@ handle_call({tcp_connect,Owner,SrcIP,SrcPort,DstIP,DstPort,_Options},
 		    {reply, {error, einval}, State};
 		{ok,SrcMac} ->
 		    Ref = erlang:monitor(process, Owner),
+		    Mss = if State#state.mtu > ?TCP_IPV4_HEADER_MIN_LEN ->
+				  State#state.mtu-?TCP_IPV4_HEADER_MIN_LEN;
+			     true -> 1500 - ?TCP_IPV4_HEADER_MIN_LEN
+			  end,
+		    Ostream = #stream { mss=Mss, seq=random_32() },
+		    Istream = #stream {},
 		    Socket = #socket { ref=Ref, mac = SrcMac,
 				       src = SrcIP,
 				       src_port = SrcPort,
 				       dst = DstIP,
 				       dst_port = DstPort,
-				       proto = tcp, owner = Owner },
+				       proto = tcp, 
+				       tcp_state = syn_sent,
+				       ostream = Ostream,
+				       istream = Istream,
+				       owner = Owner },
 		    Sockets = dict:store(Key, Socket, State#state.sockets),
 		    SockRef = dict:store(Ref, Key, State#state.sockref),
-		    State1 =  State#state { sockets=Sockets, sockref=SockRef},
-		    %% FIXME: send syn here!
-		    {reply, {ok,Ref}, State1}
+		    State1 = State#state { sockets=Sockets, sockref=SockRef },
+		    TcpOptions = [],
+		    State2 = transmit_syn(Socket,TcpOptions,State1),
+		    {reply, {ok,Ref}, State2}
 	    end;
 	{ok,_Socket} ->
 	    {reply, {error,ealready}, State}
@@ -555,52 +609,61 @@ handle_udp(_Udp,_IP,_Eth,State) ->
 
 handle_tcp(Tcp=#tcp { src_port = SrcPort, dst_port = DstPort },
 	   IP, Eth, State) ->
-    case dict:find({tcp,IP#ipv4.dst,DstPort,IP#ipv4.src,SrcPort},
-		   State#state.sockets) of
+    Key = {tcp,IP#ipv4.dst,DstPort,IP#ipv4.src,SrcPort},
+    case dict:find(Key, State#state.sockets) of
 	error ->
-	    case dict:find({tcp,IP#ipv4.dst,DstPort},State#state.sockets) of
+	    LKey = {tcp,IP#ipv4.dst,DstPort},
+	    case dict:find(LKey,State#state.sockets) of
 		error ->
 		    ?dbg("handle_tcp: not handled: ~p\n", [Tcp]),
 		    %% icmp error?
 		    State;
 		{ok,Socket} ->
-		    handle_tcp_accept(Socket,Tcp,IP,Eth,State)
+		    handle_tcp_input(LKey,Socket,Tcp,IP,Eth,State)
 	    end;
 	{ok,Socket} ->
-	    handle_tcp_input(Socket,Tcp,IP,Eth,State)
+	    handle_tcp_input(Key,Socket,Tcp,IP,Eth,State)
     end;
 handle_tcp(_Tcp,_IP,_Eth,State) ->
     ?dbg("handle_tcp: not handled: ~p\n", [_Tcp]),
     State.
 
-handle_tcp_accept(LSocket,Tcp,IP,Eth,State) ->
+handle_tcp_input(Key,LSocket=#socket{tcp_state=listen},Tcp,IP,Eth,State) ->
     case Tcp of
 	#tcp { urg=false,ack=false,psh=false,rst=false,syn=true,fin=false,
-	       window=Window,options=_Options,data= <<>> } ->
-	    LKey = {tcp,IP#ipv4.dst,Tcp#tcp.dst_port},
-	    Key = {tcp,IP#ipv4.dst,Tcp#tcp.dst_port,
-		   IP#ipv4.src,Tcp#tcp.src_port},
+	       window=Window,options=Options,data= <<>> } ->
 	    case LSocket#socket.aqueue of
 		[{Ref,Pid}|AQueue] ->
+		    Key1 = {tcp,IP#ipv4.dst,Tcp#tcp.dst_port,
+			    IP#ipv4.src,Tcp#tcp.src_port},
+		    Mss = if State#state.mtu > ?TCP_IPV4_HEADER_MIN_LEN ->
+				  State#state.mtu-?TCP_IPV4_HEADER_MIN_LEN;
+			     true -> 1500 - ?TCP_IPV4_HEADER_MIN_LEN
+			  end,
+		    Wscale = proplists:get_value(window_size_shift,Options,0),
+		    Ostream = #stream { mss=Mss, seq=random_32(),
+					wsize=Window, wscale=Wscale },
+		    Istream = #stream { seq=?seq_next(Tcp#tcp.seq_no) },
+
 		    Socket = #socket { ref=Ref, mac = Eth#eth.dst,
 				       src = IP#ipv4.dst,
 				       src_port = Tcp#tcp.dst_port,
 				       dst = IP#ipv4.src,
 				       dst_port = Tcp#tcp.src_port,
-				       seq = 1234,
-				       ack = Tcp#tcp.seq_no,
-				       window = Window,
-				       proto = tcp, owner = Pid },
-		    ?dbg("socket accept = ~w\n", [Socket]),
+				       tcp_state = syn_rcvd,
+				       proto = tcp, 
+				       owner = Pid,
+				       istream = Istream,
+				       ostream = Ostream
+				     },
+		    ?dbg("socket syn_rcvd = ~w\n", [Socket]),
 		    LSocket1 = LSocket#socket { aqueue = AQueue },
-		    Sockets1 = dict:store(LKey, LSocket1, State#state.sockets),
-		    Sockets2 = dict:store(Key, Socket, Sockets1),
-		    SockRef = dict:store(Ref, Key, State#state.sockref),
+		    Sockets1 = dict:store(Key, LSocket1, State#state.sockets),
+		    Sockets2 = dict:store(Key1, Socket, Sockets1),
+		    SockRef = dict:store(Ref, Key1, State#state.sockref),
 		    State1 =  State#state { sockets=Sockets2, sockref=SockRef},
-		    transmit_syn_ack(Socket, [{mss,1460}], State),
-		    %% FIXME: send syn/ack!
-		    Pid ! {tcp_connected, Ref, IP#ipv4.dst, Tcp#tcp.dst_port},
-		    State1;
+		    TcpOptions = [],
+		    transmit_syn_ack(Socket, TcpOptions, State1);
 		[] ->
 		    %% no one will accept the call?
 		    ?dbg("handle_tcp_accept: no acceptor: ~p\n", [Tcp]),
@@ -610,11 +673,100 @@ handle_tcp_accept(LSocket,Tcp,IP,Eth,State) ->
 	    %% no one will accept the call?
 	    ?dbg("handle_tcp_accept: tcp not accepted: ~p\n", [Tcp]),
 	    State
-    end.
-
-handle_tcp_input(_Socket,Tcp,_IP,_Eth,State) ->
+    end;
+handle_tcp_input(Key,Socket=#socket{ref=Ref,
+				    tcp_state=syn_rcvd,
+				    istream=Istream,
+				    ostream=Ostream,
+				    owner=Pid
+				   },Tcp,IP,_Eth,State) ->
+    case Tcp of
+	#tcp { seq_no=Seq,ack_no=Ack,urg=false,ack=true,psh=false,
+	       rst=false,syn=false,fin=false,
+	       window=Window,options=Options,data= <<>> } when
+	      Ack =:= ?seq_next(Ostream#stream.seq) ->
+	    Pid ! {tcp_connected, Ref, IP#ipv4.src, Tcp#tcp.src_port},
+	    Wscale = proplists:get_value(window_size_shift,Options,0),
+	    Ostream1 = Ostream#stream {	seq=Ack, wsize=Window, wscale=Wscale },
+	    Istream1 = Istream#stream { seq=?seq_next(Seq) },
+	    Socket1 = Socket#socket { tcp_state = established,
+				      istream = Istream1,
+				      ostream = Ostream1 },
+	    Sockets1 = dict:store(Key, Socket1, State#state.sockets),
+	    State#state { sockets = Sockets1 };
+	_ ->
+	    ?dbg("handle_tcp_input(syn_rcvd): tcp dropped: ~p\n", [Tcp]),
+	    State
+    end;
+handle_tcp_input(Key,Socket=#socket{ref=Ref,
+				    tcp_state=syn_sent,
+				    istream=Istream,
+				    ostream=Ostream,
+				    owner=Pid
+				   },Tcp,IP,_Eth,State) ->
+    case Tcp of
+	#tcp { seq_no=Seq,ack_no=Ack,urg=false,ack=true,psh=false,
+	       rst=false,syn=true,fin=false,
+	       window=Window,options=Options,data= <<>> } when
+	      Ack =:= ?seq_next(Ostream#stream.seq) ->
+	    Pid ! {tcp_connected, Ref, IP#ipv4.src, Tcp#tcp.src_port},
+	    Mss = proplists:get_value(mss, Options,
+				      1500-?TCP_IPV4_HEADER_MIN_LEN),
+	    Wscale = proplists:get_value(window_size_shift,Options,0),
+	    Ostream1 = Ostream#stream { seq=Ack },
+	    Istream1 = Istream#stream { wsize=Window, wscale=Wscale,
+					mss = Mss, bytes=0, 
+					seq=?seq_next(Seq),
+					segs=[]},
+	    Socket1 = Socket#socket { tcp_state = established,
+				      ostream=Ostream1,
+				      istream=Istream1 },
+	    Sockets1 = dict:store(Key, Socket1, State#state.sockets),
+	    TcpOptions = [],
+	    State1 = State#state { sockets = Sockets1 },
+	    transmit_ack(Socket1,TcpOptions,State1);
+	_ ->
+	    ?dbg("handle_tcp_input(syn_rcvd): tcp dropped: ~p\n", [Tcp]),
+	    State
+    end;
+handle_tcp_input(Key,Socket=#socket{ref=Ref,
+				    tcp_state=established,
+				    istream=Istream,
+				    ostream=Ostream,
+				    owner=Pid
+				   },Tcp,_IP,_Eth,State) ->
+    case Tcp of
+	#tcp { seq_no=Seq,ack_no=Ack,urg=false,ack=IsAck,psh=true,
+	       rst=false,syn=false,fin=false,
+	       window=Window,options=Options,data=Data } ->
+	    Ostream1 = ack_output_data(IsAck, Ack, Ostream),
+	    if Seq =:= Istream#stream.seq ->  %% new data
+		    Pid ! {tcp,Ref,Data},
+		    Wscale = proplists:get_value(window_size_shift,Options,0),
+		    Len = byte_size(Data),
+		    Istream1 = Istream#stream { wsize=Window, wscale=Wscale,
+						seq=?u32(Seq+Len),
+						segs=[]},
+		    Socket1 = Socket#socket { ostream=Ostream1,
+					      istream=Istream1 },
+		    Sockets1 = dict:store(Key, Socket1, State#state.sockets),
+		    TcpOptions = [],
+		    State1 = State#state { sockets = Sockets1 },
+		    transmit_ack(Socket1,TcpOptions,State1);
+	       true ->
+		    Socket1 = Socket#socket { ostream=Ostream1 },
+		    Sockets1 = dict:store(Key, Socket1, State#state.sockets),
+		    TcpOptions = [],
+		    State1 = State#state { sockets = Sockets1 },
+		    transmit_ack(Socket1,TcpOptions,State1)
+	    end;
+	_ ->
+	    ?dbg("handle_tcp_input(established): tcp dropped: ~p\n", [Tcp]),
+	    State
+    end;
+handle_tcp_input(_Key,_Socket,Tcp,_IP,_Eth,State) ->
     ?dbg("handle_tcp_input: not handled: ~p\n", [Tcp]),
-    State.    
+    State.
 
 
 %% respon or cache arp entries
@@ -636,11 +788,11 @@ handle_arp(Arp=#arp { op = request,
 	    case dict:find(TargetIP, State#state.ipmac) of
 		error ->
 		    State;
-		{ok,_TargetMac} ->
-		    ?dbg("handle arp reply with mac=~w\n", [TargetMac]),
+		{ok,TargetMac1} ->
+		    ?dbg("handle arp reply with mac=~w\n", [TargetMac1]),
 		    transmit_arp(Eth#eth.src,Eth#eth.dst,
 				 Arp#arp { op=reply,
-					   sender={TargetMac,TargetIP},
+					   sender={TargetMac1,TargetIP},
 					   target={SenderMac,SenderIP}}, State),
 		    State
 	    end;
@@ -650,6 +802,19 @@ handle_arp(Arp=#arp { op = request,
 handle_arp(Arp,_Eth,State) ->
     ?dbg("handle_arp: not handled: ~p\n", [Arp]),
     State.
+
+%% Handle ack of output data (fixme handle sack)
+ack_output_data(true, Ack, Ostream) -> %% check Ack within expected bounds
+    if Ack =:= ?seq_next(Ostream#stream.seq+Ostream#stream.bytes) ->
+	    Ostream1 = Ostream#stream { seq = Ack },
+	    %% transmit data
+	    Ostream1;
+       true ->
+	    Ostream
+    end;
+ack_output_data(false, _Ack, Ostream) ->
+    Ostream.
+
 
 transmit_arp(Dst,Src,Arp,State) ->
     Frame=#eth { src=Src, dst=Dst, type=arp, data=Arp},
@@ -678,29 +843,93 @@ transmit_udp(Ref,DstIP,DstPort,Data,State) ->
 	    end
     end.
 
-transmit_syn_ack(Socket, Options, State) ->
+
+transmit_syn(Socket=#socket{ostream=Ostream, istream=Istream},Options,State) ->
+    Options1 = if Istream#stream.wscale > 0 ->
+		       [{window_size_shift, Istream#stream.wscale}|Options];
+		  true ->
+		       Options
+	       end,
+    Options2 = [{mss,Ostream#stream.mss}|Options1],
+
     Tcp = #tcp { src_port = Socket#socket.src_port,
 		 dst_port = Socket#socket.dst_port,
-		 seq_no   = Socket#socket.seq,
-		 ack_no   = Socket#socket.ack,
+		 seq_no   = Ostream#stream.seq,
+		 ack_no   = Istream#stream.seq,
+		 data_offset=0,
+		 reserved=0,
+		 urg=false,ack=false,psh=false,
+		 rst=false,syn=true,fin=false,
+		 window= Ostream#stream.wsize,
+		 csum=correct,
+		 urg_pointer=0,
+		 options = Options2,
+		 data = <<>>},
+    Ip  = #ipv4 { src=Socket#socket.src,
+		  dst=Socket#socket.dst, 
+		  proto=tcp, data=Tcp },
+    DstMac = cache_lookup(Socket#socket.dst, State), %% fixme!!!
+    Eth = #eth { src=Socket#socket.mac, dst=DstMac,type=ipv4,data=Ip },
+    ?dbg("transmit syn = ~w\n", [Eth]),
+    transmit_frame(Eth, State),
+    State.
+    
+transmit_syn_ack(Socket=#socket{ostream=Ostream, istream=Istream},
+		 Options, State) ->
+    Options1 = if Istream#stream.wscale > 0 ->
+		       [{window_size_shift, Istream#stream.wscale}|Options];
+		  true ->
+		       Options
+	       end,
+    Options2 = [{mss,Ostream#stream.mss}|Options1],
+    Tcp = #tcp { src_port = Socket#socket.src_port,
+		 dst_port = Socket#socket.dst_port,
+		 seq_no   = Ostream#stream.seq,
+		 ack_no   = Istream#stream.seq,
 		 data_offset=0,
 		 reserved=0,
 		 urg=false,ack=true,psh=false,
 		 rst=false,syn=true,fin=false,
-		 window=65535,
+		 window=Istream#stream.wsize,
 		 csum=correct,
 		 urg_pointer=0,
-		 options = Options,
+		 options = Options2,
 		 data = <<>>},
     Ip  = #ipv4 { src=Socket#socket.src,
 		  dst=Socket#socket.dst, proto=tcp, data=Tcp },
-    %% this lookup should be placed before udp_send!
-    DstMac = cache_lookup(Socket#socket.dst, State),
-    Eth = #eth { src=Socket#socket.mac, dst=DstMac,
-		 type=ipv4,data=Ip },
+    DstMac = cache_lookup(Socket#socket.dst, State), %% fixme!!!
+    Eth = #eth { src=Socket#socket.mac, dst=DstMac,type=ipv4,data=Ip },
     ?dbg("transmit syn/ack = ~w\n", [Eth]),
-    transmit_frame(Eth, State).
+    transmit_frame(Eth, State),
+    State.
 
+transmit_ack(Socket=#socket{ostream=Ostream, istream=Istream},
+	     Options, State) ->
+    Options1 = if Istream#stream.wscale > 0 ->
+		       [{window_size_shift, Istream#stream.wscale}|Options];
+		  true ->
+		       Options
+	       end,
+    Tcp = #tcp { src_port = Socket#socket.src_port,
+		 dst_port = Socket#socket.dst_port,
+		 seq_no   = Ostream#stream.seq,
+		 ack_no   = Istream#stream.seq,
+		 data_offset=0,
+		 reserved=0,
+		 urg=false,ack=true,psh=false,
+		 rst=false,syn=false,fin=false,
+		 window=Istream#stream.wsize,
+		 csum=correct,
+		 urg_pointer=0,
+		 options = Options1,
+		 data = <<>>},
+    Ip  = #ipv4 { src=Socket#socket.src,
+		  dst=Socket#socket.dst, proto=tcp, data=Tcp },
+    DstMac = cache_lookup(Socket#socket.dst, State), %% fixme!!!
+    Eth = #eth { src=Socket#socket.mac, dst=DstMac,type=ipv4,data=Ip },
+    ?dbg("transmit ack = ~w\n", [Eth]),
+    transmit_frame(Eth, State),
+    State.
 
 
 transmit_frame(Frame, State) ->
@@ -713,6 +942,10 @@ get_mac_address(Interface) ->
 	false -> undefined;
 	{_,Fs} -> list_to_tuple(proplists:get_value(hwaddr,Fs))
     end.
+
+random_32() ->
+    <<X:32>> = crypto:rand_bytes(4),
+    X.
 
 %% build for 
 insert_cache(_, {0,0,0,0,0,0}, State) -> State;
