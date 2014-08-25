@@ -104,23 +104,16 @@ make_program_list([Expr|ExprList],Offs,I) ->
      bpf:return(I),
      Prog1].
 
-
 build_(Prog0) ->
-    io:format("program 0\n"),
-    io:format("---------\n"),
     Bs0 = bpf_bs:from_prog(Prog0),
-    bpf_bs:print(Bs0),
+    %% bpf_bs:print(Bs0),
     case bpf:validate(Prog0) of
 	E={error,_} -> E;
 	_ ->
 	    Bs1 = optimise(Bs0),
 	    Prog1 = bpf_bs:to_prog(Bs1),
-	    io:format("the C program\n"),
-	    io:format("-----------\n"),
-	    bpf:print_c(Prog1),
-	    io:format("the program\n"),
-	    io:format("-----------\n"),
-	    bpf:print(Prog1),
+	    %% bpf:print_c(Prog1),
+	    %% bpf:print(Prog1),
 	    case bpf:validate(Prog1) of
 		E={error,_} -> E;
 		_ -> Prog1
@@ -808,7 +801,6 @@ tcp_flag_expr(Fld, Num, Offs, Sp) ->
 
 
 pexpr(Code,K0,Offs,Sp0) ->
-    %% io:format("pexpr: ~w\n", [{Code,K0,Offs,Sp0}]),
     K = pexpr_k(K0)+Offs,
     Sp1 = Sp0-1,
     {Sp1, 
