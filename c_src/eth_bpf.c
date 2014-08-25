@@ -212,8 +212,7 @@ uint32_t eth_bpf_validate(uint8_t* src, uint8_t* dst, size_t n,
 	uint8_t  jf   = U8(src,i+3);
 	uint32_t k    = U32(src,i+4);
 
-	printf("validate: %d: code=%x,jt=%u,jf=%u,k=%u\r\n", pc, code,jt,jf,k);
-	       
+	// printf("validate: %d: code=%x,jt=%u,jf=%u,k=%u\r\n", pc, code,jt,jf,k);
 	switch(code) {
 	case LDAW: break;
 	case LDAH: break;

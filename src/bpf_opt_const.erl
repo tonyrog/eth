@@ -50,11 +50,11 @@ constant_propagation_([],Bs,Ds,Vs) ->
 %% constant propagate instructions in block B given values in
 %% dictionary D
 constant_eval_(B, D) ->
-    ?debug("EVAL: ~w D=~w\n", [B#bpf_block.label, dict:to_list(D)]),
+    ?debug("EVAL: ~w D=~w", [B#bpf_block.label, dict:to_list(D)]),
     {Is,D1} = constant_ev_(B#bpf_block.insns,[],D),
     {Next,NCond} = constant_ev_jmp_(B#bpf_block.next, D1),
     if Next =/= B#bpf_block.next ->
-	    ?debug("Replaced: ~w with ~w\n", [B#bpf_block.next, Next]);
+	    ?debug("Replaced: ~w with ~w", [B#bpf_block.next, Next]);
        true -> ok
     end,
     {B#bpf_block { insns = Is, next=Next, ncond=NCond }, D1}.
@@ -75,7 +75,7 @@ constant_ev_([I|Is],Js,D) ->
 		{p,X,K,N} when is_integer(X) ->
 		    K1 = X+K,
 		    I1 = I#bpf_insn{code=ldaw, k=K1},
-		    ?debug("CHANGE: ~w TO ~w\n", [I, I1]),
+		    ?debug("CHANGE: ~w TO ~w", [I, I1]),
 		    constant_set_(I1,Is,Js,a,{p,K1,N},D);
 		P ->
 		    constant_set_(I, Is, Js, a, P, D)
@@ -85,7 +85,7 @@ constant_ev_([I|Is],Js,D) ->
 		{p,X,K,N} when is_integer(X) ->
 		    K1 = X+K,
 		    I1 = I#bpf_insn{code=ldah, k=K1},
-		    ?debug("CHANGE: ~w TO ~w\n", [I, I1]),
+		    ?debug("CHANGE: ~w TO ~w", [I, I1]),
 		    constant_set_(I1,Is,Js,a,{p,K1,N},D);
 		P ->
 		    constant_set_(I, Is, Js, a, P, D)
@@ -95,7 +95,7 @@ constant_ev_([I|Is],Js,D) ->
 		{p,X,K,N} when is_integer(X) ->
 		    K1 = X+K,
 		    I1 = I#bpf_insn{code=ldab, k=K1},
-		    ?debug("CHANGE: ~w TO ~w\n", [I, I1]),
+		    ?debug("CHANGE: ~w TO ~w", [I, I1]),
 		    constant_set_(I1,Is,Js,a,{p,K1,N},D);
 		P ->
 		    constant_set_(I, Is, Js, a, P, D)
@@ -108,7 +108,7 @@ constant_ev_([I|Is],Js,D) ->
 	    case get_reg({m,K},D) of
 		K1 when is_integer(K1) ->
 		    I1 = I#bpf_insn{code=ldc,k=K1},
-		    ?debug("CHANGE: ~w TO ~w\n", [I, I1]),
+		    ?debug("CHANGE: ~w TO ~w", [I, I1]),
 		    constant_ev_(Is,[I1|Js],set_reg(a,K1,D));
 		R ->
 		    constant_ev_(Is,[I|Js], set_reg(a,R,D))
@@ -120,7 +120,7 @@ constant_ev_([I|Is],Js,D) ->
 	    case get_reg({m,K}, D) of
 		K1 when is_integer(K1) ->
 		    I1 = I#bpf_insn{code=ldxc,k=K1},
-		    ?debug("CHANGE: ~w TO ~w\n", [I, I1]),
+		    ?debug("CHANGE: ~w TO ~w", [I, I1]),
 		    constant_ev_(Is,[I1|Js], set_reg(x,K1,D));
 		R ->
 		    constant_ev_(Is,[I|Js], set_reg(x,R,D))
@@ -163,7 +163,7 @@ constant_set_(I, Is, Js, R, V, D) ->
 	undefined -> %% no value defined
 	    constant_ev_(Is,[I|Js], set_reg(R, V, D));
 	V -> %% value already loaded
-	    ?debug("REMOVE: ~w, value ~w already set\n", [I,V]),
+	    ?debug("REMOVE: ~w, value ~w already set", [I,V]),
 	    constant_ev_(Is,Js,D);
 	_ ->
 	    constant_ev_(Is,[I|Js], set_reg(R, V, D))
@@ -195,7 +195,7 @@ match_(A,B) ->
     match_(A,B,"").
 
 match_(A,B,I) ->
-    ?debug("~sMATCH ~w, ~w\n", [I,A,B]),
+    ?debug("~sMATCH ~w, ~w", [I,A,B]),
     R = match__(A,B,["  ",I]),
     ?debug("~s=~w\n", [I,R]),
     R.
@@ -250,7 +250,7 @@ eval_op_(I, Is, Js, D, Op, R, A, Op1, Op2) ->
 	K1 when is_integer(K1) ->
 	    D1 = set_reg(R,K1,D),
 	    I1 = I#bpf_insn { code=Op1, k=K1},
-	    ?debug("CHANGE: ~w TO ~w\n", [I, I1]),
+	    ?debug("CHANGE: ~w TO ~w", [I, I1]),
 	    constant_ev_(Is, [I1|Js], D1);
 	V1 ->
 	    D1 = set_reg(R,V1,D),
@@ -260,25 +260,25 @@ eval_op_(I, Is, Js, D, Op, R, A, Op1, Op2) ->
 		    %% Try remove noops, more?
 		    case Op2 of
 			subk when K0 =:= 0 ->
-			    ?debug("REMOVE: ~w\n", [I1]),
+			    ?debug("REMOVE: ~w", [I1]),
 			    constant_ev_(Is, Js, D1);
 			addk when K0 =:= 0 ->
-			    ?debug("REMOVE: ~w\n", [I1]),
+			    ?debug("REMOVE: ~w", [I1]),
 			    constant_ev_(Is, Js, D1);
 			mulk when K0 =:= 1 ->
-			    ?debug("REMOVE: ~w\n", [I1]),
+			    ?debug("REMOVE: ~w", [I1]),
 			    constant_ev_(Is, Js, D1);
 			divk when K0 =:= 1 ->
-			    ?debug("REMOVE: ~w\n", [I1]),
+			    ?debug("REMOVE: ~w", [I1]),
 			    constant_ev_(Is, Js, D1);
 			lshk when K0 =:= 0 ->
-			    ?debug("REMOVE: ~w\n", [I1]),
+			    ?debug("REMOVE: ~w", [I1]),
 			    constant_ev_(Is, Js, D1);
 			rshk when K0 =:= 0 ->
-			    ?debug("REMOVE: ~w\n", [I1]),
+			    ?debug("REMOVE: ~w", [I1]),
 			    constant_ev_(Is, Js, D1);
 			_ ->
-			    ?debug("CHANGE: ~w TO ~w\n", [I, I1]),
+			    ?debug("CHANGE: ~w TO ~w", [I, I1]),
 			    constant_ev_(Is, [I1|Js], D1)
 		    end;
 		_ ->
@@ -291,7 +291,7 @@ eval_op_(I, Is, Js, D, Op, R, OpK) ->
 	K1 when is_integer(K1) ->
 	    D1 = set_reg(R,K1,D),
 	    I1 = I#bpf_insn { code=OpK, k=K1},
-	    ?debug("CHANGE: ~w TO ~w\n", [I, I1]),
+	    ?debug("CHANGE: ~w TO ~w", [I, I1]),
 	    constant_ev_(Is, [I1|Js], D1);
 	V1 ->
 	    D1 = set_reg(R,V1,D),
@@ -302,14 +302,13 @@ eval_op_(I, Is, Js, D, Op, R, OpK) ->
 set_reg(R, undefined, D) ->
     dict:erase(R, D);
 set_reg(R, V, D) ->
-    %% io:format("set_reg: ~w = ~w\n", [R, V]),
     dict:store(R, V, D).
 
 %% get the value of {p,X,K,N}  (K is constant, N=1,2|4)
 get_pind(K,N,D) ->
     case get_ureg(x,D) of
 	undefined ->
-	    ?warning("get_reg: ~w = undefined!!\n", [x]),
+	    ?warning("get_reg: ~w = undefined!!", [x]),
 	    undefined;
 	X -> {p,X,K,N}
     end.

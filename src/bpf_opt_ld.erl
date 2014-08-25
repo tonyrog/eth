@@ -35,63 +35,63 @@ remove_ld_bl_([I1=#bpf_insn { code=txa }, #bpf_insn {code=sta,k=K}|Is]) ->
 
 %% M[k]=A,X=M[k] =>  M[k]=A, X=A ; not that A=X must be kept!
 remove_ld_bl_([I1=#bpf_insn {code=sta,k=K},_I2=#bpf_insn { code=ldx,k=K}|Is]) ->
-    ?debug("REMOVE: ~w\n", [_I2]),
+    ?debug("REMOVE: ~w", [_I2]),
     [I1 | remove_ld_bl_([#bpf_insn {code=tax}| Is])];
 
 %% M[k] = A, <opA>, A=M[k]  => M[k]=A [<opA]
 remove_ld_bl_([I1=#bpf_insn{code=sta,k=K},I2,_I3=#bpf_insn{code=lda,k=K}|Is]) ->
     case bpf:class(I2) of
 	{alu,_,_}    -> %% ineffective, remove I2,I3
-	    ?debug("REMOVE: ~w\n", [I2]),
-	    ?debug("REMOVE: ~w\n", [_I3]),
+	    ?debug("REMOVE: ~w", [I2]),
+	    ?debug("REMOVE: ~w", [_I3]),
 	    remove_ld_bl_([I1|Is]);
 	{misc,a,x}   -> %% ineffective, remove I2,I3
-	    ?debug("REMOVE: ~w\n", [I2]),
-	    ?debug("REMOVE: ~w\n", [_I3]),
+	    ?debug("REMOVE: ~w", [I2]),
+	    ?debug("REMOVE: ~w", [_I3]),
 	    remove_ld_bl_([I1|Is]);
 	{misc,x,a}   -> %% remove I3 since X is update to A
-	    ?debug("REMOVE: ~w\n", [_I3]),
+	    ?debug("REMOVE: ~w", [_I3]),
 	    remove_ld_bl_([I1,I2|Is]);
 	{st,a,{k,K}} -> %% I1 = I2 remove I2,I3
-	    ?debug("REMOVE: ~w\n", [I2]),
-	    ?debug("REMOVE: ~w\n", [_I3]),
+	    ?debug("REMOVE: ~w", [I2]),
+	    ?debug("REMOVE: ~w", [_I3]),
 	    remove_ld_bl_([I1|Is]);
 	{st,_,_}     -> %% just remove I3
-	    ?debug("REMOVE: ~w\n", [_I3]),
+	    ?debug("REMOVE: ~w", [_I3]),
 	    remove_ld_bl_([I1,I2|Is]);	    
 	{ld,x,_}     ->
-	    ?debug("REMOVE: ~w\n", [_I3]),
+	    ?debug("REMOVE: ~w", [_I3]),
 	    remove_ld_bl_([I1,I2|Is]);
 	{ld,a,_}     -> %% A=<...>  A is reloaded in I3
-	    ?debug("REMOVE: ~w\n", [I2]),
-	    ?debug("REMOVE: ~w\n", [_I3]),
+	    ?debug("REMOVE: ~w", [I2]),
+	    ?debug("REMOVE: ~w", [_I3]),
 	    remove_ld_bl_([I1|Is])
     end;
 %% M[k]=X, INSN, X=M[k]  => M[k]=X, INSN
 remove_ld_bl_([I1=#bpf_insn{code=stx,k=K},I2,_I3=#bpf_insn{code=ldx,k=K}|Is]) ->
     case bpf:class(I2) of
 	{alu,_,_} ->   %% A += <...>  do not update X remove I3
-	    ?debug("REMOVE: ~w\n", [_I3]),
+	    ?debug("REMOVE: ~w", [_I3]),
 	    remove_ld_bl_([I1,I2|Is]);
 	{misc,a,x} ->  %% A=X remove I3
-	    ?debug("REMOVE: ~w\n", [_I3]),
+	    ?debug("REMOVE: ~w", [_I3]),
 	    remove_ld_bl_([I1,I2|Is]);
 	{misc,x,a} ->  %% X=A ineffective, remove I2,I3
-	    ?debug("REMOVE: ~w\n", [I2]),
-	    ?debug("REMOVE: ~w\n", [_I3]),
+	    ?debug("REMOVE: ~w", [I2]),
+	    ?debug("REMOVE: ~w", [_I3]),
 	    remove_ld_bl_([I1|Is]);
 	{st,x,{k,K}} -> %% I1=I2, duplicate, remove I2,I3
-	    ?debug("REMOVE: ~w\n", [I2]),
-	    ?debug("REMOVE: ~w\n", [_I3]),
+	    ?debug("REMOVE: ~w", [I2]),
+	    ?debug("REMOVE: ~w", [_I3]),
 	    remove_ld_bl_([I1|Is]);
 	{st,x,_} ->     %% remove I3
-	    ?debug("REMOVE: ~w\n", [_I3]),
+	    ?debug("REMOVE: ~w", [_I3]),
 	    remove_ld_bl_([I1,I2|Is]);
 	{ld,a,_} ->     %% A=<..>, keep x is not updated
 	    remove_ld_bl_([I1,I2|Is]);
 	{ld,x,_}     -> %% X=<..>  X is reloaded in I3 
-	    ?debug("REMOVE: ~w\n", [I2]),
-	    ?debug("REMOVE: ~w\n", [_I3]),
+	    ?debug("REMOVE: ~w", [I2]),
+	    ?debug("REMOVE: ~w", [_I3]),
 	    remove_ld_bl_([I1|Is])
     end;
 remove_ld_bl_([I|Is]) ->

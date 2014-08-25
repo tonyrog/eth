@@ -23,7 +23,7 @@ run(Bs, Max) ->
     run_(Bs, 1, Max).
 
 run_(Bs, I, Max) when I < Max ->
-    ?info("OPTIMISE: ~w\n", [I]),
+    ?info("OPTIMISE: ~w", [I]),
     L = [fun bpf_opt_ld:run/1,
 	 fun bpf_opt_st:run/1,
 	 fun bpf_opt_jmp:run/1,
@@ -36,17 +36,20 @@ run_(Bs, I, Max) when I < Max ->
 	],
     Bs1 = run_list_(L, Bs#bpf_bs { changed = 0 }),
     if Bs1#bpf_bs.changed =:= 0 ->
-	    bpf_bs:print(Bs1);
+	    %% bpf_bs:print(Bs1),
+	    Bs1;
        true ->
 	    run_(Bs1, I+1, Max)
     end;
 run_(Bs, _I, Max) ->
-    io:format("Looping optimiser limit ~w was reached\n", [Max]),
-    bpf_bs:print(Bs).
+    ?warning("Looping optimiser limit ~w was reached", [Max]),
+    %% bpf_bs:print(Bs),
+    Bs.
+
 
 run_list_([F|Fs], Bs) ->
     Bs1 = F(Bs),
-    io:format("new size = ~w\n", [bpf_bs:size(Bs1)]),
+    ?info("new size = ~w", [bpf_bs:size(Bs1)]),
     run_list_(Fs, Bs1);
 run_list_([], Bs) ->
     Bs.

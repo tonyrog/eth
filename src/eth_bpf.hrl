@@ -10,19 +10,22 @@
 
 -define(uint32(X), ((X) band 16#ffffffff)).
 
+-define(log(W,M,L,F,A),
+	io:format("~s:~w: ~s: "++(F)++"\n", [M,L,W|(A)])).
+
 -ifdef(DEBUG).
--define(debug(F,A),
-	 io:format("~s:~w: debug: "++(F), [?FILE,?LINE|(A)])).
+-define(debug(F,A), ?log(debug,?FILE,?LINE,F,A)).
 -else.
 -define(debug(F,A), ok).
 -endif.
 
--define(warning(F,A), 
-	io:format("~s:~w: warning: "++(F), [?FILE,?LINE|(A)])).
--define(error(F,A),
-	io:format("~s:~w: error: "++(F), [?FILE,?LINE|(A)])).
--define(info(F,A),
-	io:format("~s:~w: info: "++(F), [?FILE,?LINE|(A)])).
+-define(warning(F,A), ?log(warning,?FILE,?LINE,F,A)).
+-define(error(F,A), ?log(error,?FILE,?LINE,F,A)).
+-ifdef(DEBUG).
+-define(info(F,A), ?log(info,?FILE,?LINE,F,A)).
+-else.
+-define(info(F,A), ok).
+-endif.
 
 %%
 %% The instruction encodings.

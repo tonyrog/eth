@@ -36,7 +36,7 @@ remove_unreach_([], Bs, Vs) ->
     All = bpf_bs:get_labels(Bs),
     Remove = All -- sets:to_list(Vs),
     lists:foldl(fun(I,Bsi) -> 
-			?debug("REMOVE BLOCK: ~w\n", [I]),
+			?debug("REMOVE BLOCK: ~w", [I]),
 			bpf_bs:del_block(I, Bsi) end, 
 		Bs, Remove).
 

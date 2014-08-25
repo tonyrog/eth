@@ -36,7 +36,7 @@ exec0(Prog,Pc,A,X,P,M) ->
 	if (K) >= 0, (K) < tuple_size((M)) ->
 		element((K)+1, (M));
 	   true -> 
-		?error("mem index out of bounds, ~w\n", [(K)]),
+		?error("mem index out of bounds, ~w", [(K)]),
 		throw(mem_index)
 	end).
 
@@ -50,7 +50,7 @@ exec0(Prog,Pc,A,X,P,M) ->
 
 exec_(Prog,Pc,A,X,P,M) ->
     #bpf_insn{code=Code,k=K} = I = element(Pc,Prog),
-    ?debug("~w: ~p, A=~w,X=~w,M=~w\n", [Pc, I,A,X,M]),
+    ?debug("~w: ~p, A=~w,X=~w,M=~w", [Pc, I,A,X,M]),
     Pc1 = Pc+1,
     case Code of
 	ldaw -> exec_(Prog, Pc1, ld_(P,K,32), X, P, M);
@@ -112,7 +112,7 @@ ld_(P,K,Size) ->
 	<<_:K/binary, LDV:Size, _/binary>> ->
 	    LDV;
 	_ ->
-	    ?error("packet offset ~w:~w out of bounds, len=~w\n", 
+	    ?error("packet offset ~w:~w out of bounds, len=~w", 
 		   [(K),(Size),byte_size((P))]),
 	    throw(packet_index)
     end.

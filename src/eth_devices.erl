@@ -210,11 +210,14 @@ pid_get_stat(Port) when is_port(Port) ->
 init([]) ->
     Driver = "eth_drv",
     ok = erl_ddll:load_driver(code:priv_dir(eth), Driver),
-    IFs = get_if_addr_list(),
+    {ok,IFs} = inet:getifaddrs(),
     %% fixme: subscriber to netlink events, when interfaces are
     %% added and removed!
     Ds = [#device { name=Name,
-		    hwaddr=proplists:get_value(hwaddr,Fs,[])
+		    hwaddr=case proplists:get_value(hwaddr,Fs,"") of
+			       [A,B,C,D,E,F] -> {A,B,C,D,E,F};
+			       _ -> undefined
+			   end
 		  } || {Name,Fs} <- IFs ],
     {ok, #state{ devices = Ds }}.
 
@@ -239,24 +242,46 @@ handle_call({find,Name}, _From, State) ->
 	D ->
 	    {reply, {ok, D#device.port}, State}
     end;
-handle_call({open,Name}, _From, State) ->
+handle_call({open,"tap"}, _From, State) -> %% create a new tap device
+    try erlang:open_port({spawn_driver, "eth_drv tap"},[binary]) of
+	Port ->
+	    case port_call(Port, ?CMD_BIND, "tap") of
+		{ok,Name} -> %% the instance name like tap0, tap1...
+		    %% pick up hardware address if possible
+		    HwAddr = case inet:ifget(Name, [hwaddr]) of
+				{ok,[{hwaddr,[A,B,C,D,E,F]}]} ->
+				     {A,B,C,D,E,F};
+				 _ ->
+				     undefined
+			     end,
+		    Dev = #device { name=Name, port=Port, hwaddr=HwAddr },
+		    Ds = [Dev | State#state.devices],
+		    {reply, {ok,Port}, State#state { devices=Ds }};
+		Error ->
+		    erlang:port_close(Port),
+		    {reply, Error, State}
+	    end
+    catch
+	error:Reason ->
+	    {reply, {error,Reason}, State}
+    end;
+handle_call({open,Name}, _From, State) -> %% open existing device
     case lists:keytake(Name, #device.name, State#state.devices) of
 	false ->
 	    {reply, {error,enoent}, State};
 	{value,D,Ds} ->
-	    if is_port(D#device.port) ->
+	    if is_port(D#device.port) -> %% already open
 		    {reply, {ok,D#device.port}, State};
 	       true ->
 		    Driver = "eth_drv "++Name,
 		    try erlang:open_port({spawn_driver, Driver},[binary]) of
 			Port ->
 			    case port_call(Port, ?CMD_BIND, Name) of
-				{ok,Name1} ->
-				    D1 = D#device { name=Name1, port=Port },
-				    %% inform subscriber that interface is open?
-				    %% re-set the filter ...
+				{ok,Name} ->
+				    D1 = D#device { port=Port },
+				    send_subs(D1, {eth,open,Name,Port}),
 				    Ds1 = [D1 | Ds],
-				    {reply, {ok,Port}, 
+				    {reply, {ok,Port},
 				     State#state { devices=Ds1 }};
 				Error ->
 				    erlang:port_close(Port),
@@ -273,20 +298,12 @@ handle_call({close,Name}, _From, State) ->
 	false ->
 	    {reply, {error,enoent}, State};
 	{value,D,Ds} ->
-	    case port_call(D#device.port, ?CMD_UNBIND, Name) of
-		ok ->
-		    erlang:port_close(D#device.port),
-		    D1 = D#device { port=undefined },
-		    %% inform subscriber that interface is closed?
-		    Ds1 = [D1 | Ds],
-		    {reply, ok, State#state { devices = Ds1 }};
-		Error ->
-		    erlang:port_close(D#device.port),
-		    D1 = D#device { port=undefined },
-		    %% inform subscriber that interface is closed?
-		    Ds1 = [D1 | Ds],
-		    {reply, Error, State#state { devices = Ds1 }}
-	    end
+	    catch port_call(D#device.port, ?CMD_UNBIND, Name),
+	    erlang:port_close(D#device.port),
+	    D1 = D#device { port=undefined },
+	    send_subs(D1, {eth,closed,Name}),
+	    Ds1 = [D1 | Ds],
+	    {reply, ok, State#state { devices = Ds1 }}
     end;
 handle_call({set_debug,Name,Level}, _From, State) ->
     case lists:keyfind(Name, #device.name, State#state.devices) of
@@ -484,9 +501,8 @@ level(alert) -> ?DLOG_ALERT;
 level(emergency) -> ?DLOG_EMERGENCY;
 level(none) -> ?DLOG_NONE.
 
-%% get all known interfaces and the addresses
-
-get_if_addr_list() ->
-    {ok,IFs} = inet:getifaddrs(),
-    %% add tap interfaces tap0..tap9
-    IFs ++ [{"tap",[]}] ++ [{"tap"++[N],[]} || N <- lists:seq($0,$9)].
+send_subs(D, Message) ->
+    lists:foreach(
+      fun(S) ->
+	      S#subscriber.pid ! Message
+      end, D#device.subs).

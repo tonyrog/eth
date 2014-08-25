@@ -10,9 +10,9 @@
 -include_lib("enet/include/enet_types.hrl").
 
 -export([decode/1, decode/2]).
--export([fmt_json/1, fmt_yang/1]).
--export([dump/1, dump_json/1, dump_yang/1]).
--export([parse_json/1, parse_yang/1]).
+-export([fmt_json/1, fmt_yang/1, fmt_erl/1]).
+-export([dump/1, dump_json/1, dump_yang/1, dump_erl/1]).
+-export([parse_json/1, parse_yang/1, parse_erl/1]).
 -export([ethtoa/1]).
 
 -define(Q, $").
@@ -51,12 +51,12 @@ fmt_json_record(I,P,Fs,N) ->
     [R|Ds] = tuple_to_list(P),
     [ "{",N,
       fmt_json_fields(I+2, R, [struct|Fs], [R|Ds], N),
-      N, indent(I), "}" ].
+      N, indent(I,N), "}" ].
 
 fmt_json_fields(I,R,[F],[D],N) ->
-    [ [indent(I),fmt_json_field(I,R,F,D,N) ] ];
+    [ [indent(I,N),fmt_json_field(I,R,F,D,N) ] ];
 fmt_json_fields(I,R,[F|Fs],[D|Ds],N) ->
-    [ [indent(I),fmt_json_field(I,R,F,D,N),",",N] |
+    [ [indent(I,N),fmt_json_field(I,R,F,D,N),",",N] |
       fmt_json_fields(I,R,Fs,Ds,N)];
 fmt_json_fields(_I,_R,[],[],_N) ->
     [].
@@ -154,10 +154,10 @@ fmt_yang_record(I,P,Fs,N) ->
     [R|Ds] = tuple_to_list(P),
     [ atom_to_list(R), " {", N,
       fmt_yang_fields(I+2, R, Fs, Ds, N),
-      indent(I), "}" ].
+      indent(I,N), "}" ].
 
 fmt_yang_fields(I,R,[F|Fs],[D|Ds],N) ->
-    [ [indent(I),fmt_yang_field(I,R,F,D,N),separator(D,";"),N] |
+    [ [indent(I,N),fmt_yang_field(I,R,F,D,N),separator(D,";"),N] |
       fmt_yang_fields(I,R,Fs,Ds,N)];
 fmt_yang_fields(_I,_R,[],[],_N) ->
     [].
@@ -221,6 +221,111 @@ fmt_yang_elems([D]) ->
 fmt_yang_elems([D|Ds]) ->
     [fmt_yang_value(0,D,"")," " | fmt_yang_elems(Ds)];
 fmt_yang_elems([]) -> [].
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%
+%% Format values and records in Erlang record syntax format
+%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+dump_erl(P) ->
+    io:format("~s\n", [fmt_erl(P)]).
+
+parse_erl(_String) ->
+    ok.
+
+fmt_erl(P) ->
+    fmt_erl(P, "").  %% N=""|"\n"
+
+fmt_erl(P,N) ->
+    case is_pkt_record(P) of
+	true  -> fmt_erl_record(0,P,N);
+	false -> fmt_erl_value(0,P,N)
+    end.
+
+fmt_erl_record(I,P,N)  ->
+    fmt_erl_record(I,P,pkt_fields(P),N).
+
+fmt_erl_record(I,P,Fs,N) ->
+    [R|Ds] = tuple_to_list(P),
+    [ "#", atom_to_list(R), " {", N,
+      fmt_erl_fields(I+2, R, Fs, Ds, N),
+      indent(I,N), "}" ].
+
+fmt_erl_fields(I,R,[F],[D],N) ->
+    [ [indent(I,N),fmt_erl_field(I,R,F,D,N)] ];
+fmt_erl_fields(I,R,[F|Fs],[D|Ds],N) ->
+    [ [indent(I,N),fmt_erl_field(I,R,F,D,N),separator(D,","),N] |
+      fmt_erl_fields(I,R,Fs,Ds,N)];
+fmt_erl_fields(_I,_R,[],[],_N) ->
+    [].
+
+fmt_erl_field(I,R,F,D,N) ->
+    Fk = atom_to_list(F),
+    Dk = fmt_erl_value(I,R,F,D,N),
+    [Fk,"=",Dk].
+
+fmt_erl_value(I,D,N) ->
+    fmt_erl_value(I,undefined,undefined,D,N).
+
+fmt_erl_value(I,R,F,D,N) ->
+    if  
+	is_boolean(D) -> [atom_to_list(D)];
+	is_integer(D) -> [integer_to_list(D)];
+	is_atom(D)    -> [atom_to_list(D)];
+	is_binary(D), R =:= ipv4, (F =:= src orelse F =:= dst) ->
+	    IPV4 = list_to_tuple([X || <<X:8>> <= D]),
+	    [?Q,inet_parse:ntoa(IPV4),?Q];
+	is_binary(D), R =:= ipv6, (F =:= src orelse F =:= dst) ->
+	    IPV6 = list_to_tuple([X || <<X:16>> <= D]),
+	    [?Q,inet_parse:ntoa(IPV6),?Q];
+	is_binary(D), R =:= eth, (F =:= src orelse F =:= dst) ->
+	    Eth = list_to_tuple([X || <<X:8>> <= D]),
+	    [?Q,ethtoa(Eth),?Q];
+	is_binary(D) -> %% fixme!
+	    [?Q,io_lib:format("~p", [D]),?Q];
+	is_bitstring(D) -> %% fixme!
+	    [?Q,io_lib:format("~p", [D]),?Q];
+	is_tuple(D), tuple_size(D) =:= 4, R =:= ipv4,
+	(F =:= src orelse F =:= dst) ->
+	    [?Q,inet_parse:ntoa(D),?Q];
+	is_tuple(D), tuple_size(D) =:= 8, R =:= ipv6,
+	(F =:= src orelse F =:= dst) ->
+	    [?Q,inet_parse:ntoa(D),?Q];
+	is_tuple(D), tuple_size(D) =:= 6, R =:= eth,
+	(F =:= src orelse F =:= dst) ->
+	    [?Q,ethtoa(D),?Q];
+	is_tuple(D) ->
+	    case is_pkt_record(D) of
+		true ->
+		    fmt_erl_record(I+2,D,N);
+		false ->
+		    [${,fmt_erl_array(tuple_to_list(D)),$}]
+	    end;
+	is_list(D) ->
+	    try iolist_size(D) of
+		_Sz -> [?Q,D,?Q]
+	    catch
+		error:_ ->
+		    [$[,fmt_erl_array(D),$]]
+	    end
+    end.
+
+fmt_erl_array(Ds) ->
+    fmt_erl_elems(Ds).
+
+fmt_erl_elems([D]) ->
+    fmt_erl_value(0,D,"");
+fmt_erl_elems([D|Ds]) ->
+    [fmt_erl_value(0,D,""),"," | fmt_erl_elems(Ds)];
+fmt_erl_elems([]) -> [].
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%
+%% Utils
+%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
 %%    
 %% Parse binary data when needed
@@ -287,8 +392,13 @@ separator(D,S) ->
 	false -> S
     end.
 
-indent(I) ->
-    lists:duplicate(I, $\s).
+%% only indent when using newline/carriage return
+indent(I,"\n") -> lists:duplicate(I, $\s);
+indent(I,"\r\n") -> lists:duplicate(I, $\s);
+indent(I,"\n\r") -> lists:duplicate(I, $\s);
+indent(_I," ") -> " ";
+indent(_I,"") -> "".
+
 
 ethtoa([]) -> "";
 ethtoa(L=[_A,_B,_C,_D,_E,_F]) ->

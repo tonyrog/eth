@@ -33,7 +33,6 @@
 %% ===================================================================
 
 start_link() ->
-    io:format("eth_sup: start_link\n", []),
     supervisor:start_link({local, ?MODULE}, ?MODULE, []).
 
 %% ===================================================================
@@ -42,6 +41,5 @@ start_link() ->
 
 init([]) ->
     EthServer = ?CHILD(eth_devices, worker),
-    io:format("eth_sup: init [~p]\n", [EthServer]),
     {ok, { {one_for_one, 5, 10}, [EthServer]} }.
 

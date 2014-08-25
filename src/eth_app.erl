@@ -27,7 +27,6 @@
 %% ===================================================================
 
 start(_StartType, _StartArgs) ->
-    io:format("eth_app: start\n", []),
     eth_sup:start_link().
 
 stop(_State) ->

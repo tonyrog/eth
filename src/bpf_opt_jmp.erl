@@ -33,7 +33,7 @@ remove_multiple_jmp_bl_(B, Bs) ->
 	[J] ->
 	    Bj = bpf_bs:get_block(J, Bs),
 	    if Bj#bpf_block.insns =:= [] ->
-		    ?debug("REPLACE: ~w with ~w\n",
+		    ?debug("REPLACE: ~w with ~w",
 			   [B#bpf_block.next,Bj#bpf_block.next]),
 		    bpf_bs:set_next(B#bpf_block.label, Bj#bpf_block.next, Bs);
 	       true ->
@@ -67,7 +67,7 @@ remove_multiple_jmp_bl_(B, Bs) ->
 	    if Jt =/= Jt2; Jf =/= Jf2 ->
 		    Next = B#bpf_block.next,
 		    Next1 = Next#bpf_insn { jt=Jt2, jf=Jf2 },
-		    ?debug("REPLACE: ~w with ~w\n", [Next,Next1]),
+		    ?debug("REPLACE: ~w with ~w", [Next,Next1]),
 		    bpf_bs:set_next(B#bpf_block.label, Next1, Bs);
 	       true ->
 		    Bs

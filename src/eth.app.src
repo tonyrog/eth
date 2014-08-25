@@ -2,7 +2,7 @@
  [{description, "Ethernet device controller"},
   {vsn, git},
   {mod, {eth_app, []}},
-  {registered, [eth_srv]},
+  {registered, [eth_devices]},
   {env, []},
   {applications,[kernel,stdlib]}
   ]}.

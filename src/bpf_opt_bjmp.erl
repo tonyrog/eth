@@ -30,10 +30,10 @@ bitfield_jmp_bl_(B, Bs) ->
 		    ?info("Optimisation bitfield 6.a\n", []),
 		    case bpf_opt:is_referenced_aj([N#bpf_insn.jt,N#bpf_insn.jf],Bs) of
 			true ->
-			    ?debug(" REFERENCED\n", []),
+			    ?debug(" REFERENCED", []),
 			    Bs;
 			false ->
-			    ?debug(" UPDATED\n", []),
+			    ?debug(" UPDATED", []),
 			    N1 = N#bpf_insn { code=jsetk, k=(1 bsl K) },
 			    B1 = B#bpf_block { insns=lists:reverse(Is),
 					       next = N1},
@@ -51,10 +51,10 @@ bitfield_jmp_bl_(B, Bs) ->
 			    ?info("Optimisation bitfield 6.f\n", []),
 			    case bpf_opt:is_referenced_aj([L2,L3],Bs) of
 				true ->
-				    ?debug(" REFERENCED\n",[]),
+				    ?debug(" REFERENCED",[]),
 				    Bs;
 				false ->
-				    ?debug(" UPDATED\n",[]),
+				    ?debug(" UPDATED",[]),
 				    Kn = Km bor Kl,
 				    I1=#bpf_insn {code=andk, k=Kn},
 				    N2 = N1#bpf_insn { code=jeqk, k=Kn },
@@ -70,10 +70,10 @@ bitfield_jmp_bl_(B, Bs) ->
 		    ?info("Optimisation bitfield 6.b\n", []),
 		    case bpf_opt:is_referenced_aj([N#bpf_insn.jt,N#bpf_insn.jf],Bs) of
 			true ->
-			    ?debug(" REFERENCED\n",[]),
+			    ?debug(" REFERENCED",[]),
 			    Bs;
 			false ->
-			    ?debug(" UPDATED\n",[]),
+			    ?debug(" UPDATED",[]),
 			    N1 = N#bpf_insn { code=jsetk, k=Km },
 			    B1 = B#bpf_block { insns=lists:reverse(Is),
 					       next = N1},
@@ -89,10 +89,10 @@ bitfield_jmp_bl_(B, Bs) ->
 		    ?info("Optimisation bitfield 6.c\n", []),
 		    case bpf_opt:is_referenced_aj([N#bpf_insn.jt,N#bpf_insn.jf],Bs) of
 			true ->
-			    ?debug(" REFERENCED\n",[]),
+			    ?debug(" REFERENCED",[]),
 			    Bs;
 			false ->
-			    ?debug(" UPDATED\n",[]),
+			    ?debug(" UPDATED",[]),
 			    N1 = N#bpf_insn { code=jsetk, k=(1 bsl K) },
 			    B1 = B#bpf_block { insns=lists:reverse(Is),
 					       next = N1},
