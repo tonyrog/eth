@@ -14,6 +14,7 @@
 -export([start/1]).
 -export([start_link/1]).
 -export([stop/1, add_ip/3, del_ip/2, find_mac/2, query_mac/2]).
+-export([set_gw/2]).
 
 %% UDP
 -export([udp_open/4, udp_close/2, udp_send/5]).
@@ -179,7 +180,9 @@
 	  name :: string(),  %% name of interface (like "tap0", "en1", "eth0")
 	  eth,       %% interface handler
 	  mtu,       %% mtu size of interface / minimum mtu usable
-	  mac :: ethernet_address(),       %% the mac address on interface
+	  mac :: ethernet_address(),          %% the mac address on interface
+	  gw  :: ip_address(),                %% the gateway ip address
+	  gw_mac = ?ZERO :: ethernet_address(), %% the gateway mac address
 	  %% options offered & allowed in syn packets
 	  tcp_opts = ?DEFAULT_TCP_OPTIONS :: tcp_syn_options(),
 	  wssdflt = 0,   %% window scaling shift (0..14)
@@ -208,8 +211,8 @@ start(Interface) ->
 start_link(Interface) when is_list(Interface) ->
     gen_server:start_link(?MODULE, [Interface], []).
 
-stop(Arpd) ->
-    gen_server:call(Arpd, stop).
+stop(Net) ->
+    gen_server:call(Net, stop).
 
 %% udp interface
 udp_open(Net, SrcIP, SrcPort, Options) ->
@@ -283,6 +286,9 @@ find_mac(Net, IP) when tuple_size(IP) =:= 4; tuple_size(IP) =:= 8 ->
 
 query_mac(Net, IP) ->
     gen_server:call(Net, {query_mac,IP}).
+
+set_gw(Net, Gw) when tuple_size(Gw) =:= 4; tuple_size(Gw) =:= 8 ->
+    gen_server:call(Net, {set_gw,Gw}).
 
 %% Callbacks
 
@@ -497,17 +503,7 @@ handle_call({add_ip,IP,Mac}, _From, State) ->
     IPMac = dict:store(IP, Mac, State#state.ipmac),
     Macs = sets:add_element(Mac, State#state.macs),
     %% inform network about this fact, gratuitous ARP
-    {PType,PLen} = if tuple_size(IP) =:= 4 -> {ipv4, 4};
-		      tuple_size(IP) =:= 8 -> {ipv6, 16}
-		   end,
-    transmit_arp(?BROADCAST,State#state.mac,
-	     #arp { op=reply, %% or request ?
-		    htype = ethernet,
-		    ptype = PType,
-		    haddrlen = 6,
-		    paddrlen = PLen,
-		    sender={Mac,IP},
-		    target={?BROADCAST,IP}}, State),
+    send_arp(reply,Mac,?BROADCAST,IP,IP,State),
     {reply, ok, State#state { ipmac = IPMac, macs = Macs }};
 handle_call({del_ip,IP}, _From, State) ->
     IPMac = dict:erase(IP, State#state.ipmac),
@@ -527,20 +523,22 @@ handle_call({query_mac,IP}, _From, State) ->
     %% initiate a arp request
     case inet:ifget(State#state.name, [addr]) of
 	{ok,[{addr,LocalIP}]} ->
-	    {PType,PLen} = if tuple_size(IP) =:= 4 -> {ipv4, 4};
-			      tuple_size(IP) =:= 8 -> {ipv6, 16}
-			   end,
-	    transmit_arp(?BROADCAST,State#state.mac,
-		     #arp { op=request,
-			    htype = ethernet,
-			    ptype = PType,
-			    haddrlen = 6,
-			    paddrlen = PLen,
-			    sender={State#state.mac,LocalIP},
-			    target={?ZERO,IP}}, State),
+	    send_arp(request,State#state.mac,?ZERO,LocalIP,IP,State),
 	    {reply, ok, State};
 	Error ->
 	    {reply, Error, State}
+    end;
+handle_call({set_gw,Gw}, _From, State) ->
+    case dict:find(Gw, State#state.cache) of
+	error ->
+	    case dict:find(Gw, State#state.ipmac) of
+		error ->
+		    {reply, {error,enoent}, State#state{gw=Gw,gw_mac=?ZERO}};
+		{ok,Mac} ->
+		    {reply, {ok,Mac}, State#state{gw=Gw,gw_mac=Mac}}
+	    end;
+	{ok,Mac} -> 
+	    {reply, {ok,Mac}, State#state{gw=Gw,gw_mac=Mac}}
     end;
 handle_call(stop, _From, State) ->
     {stop, normal, ok, State};
@@ -1260,7 +1258,6 @@ segment_size(Data) when is_binary(Data) -> byte_size(Data);
 segment_size(Data) when is_reference(Data) -> 0;
 segment_size(?FIN) -> 1.
 
-
 transmit_arp(Dst,Src,Arp,State) ->
     Frame=#eth { src=Src, dst=Dst, type=arp, data=Arp},
     transmit_frame(Frame, State).
@@ -1278,7 +1275,7 @@ transmit_udp(Ref,DstIP,DstPort,Data,State) ->
 		    Ip  = #ipv4 { src=Socket#udp_socket.src,
 				  dst=DstIP, proto=udp, data=Udp },
 		    %% this lookup should be placed before udp_send!
-		    DstMac = cache_lookup(DstIP, State),
+		    DstMac = route_lookup(DstIP, State),
 		    Eth = #eth { src=Socket#udp_socket.mac, dst=DstMac,
 				 type=ipv4,data=Ip },
 		    transmit_frame(Eth, State),
@@ -1410,7 +1407,7 @@ transmit_ip(Socket, Proto, Data, State) ->
     Ip  = #ipv4 { src=Socket#tcp_socket.src,
 		  dst=Socket#tcp_socket.dst,
 		  proto=Proto, data=Data },
-    DstMac = cache_lookup(Socket#tcp_socket.dst, State),
+    DstMac = route_lookup(Socket#tcp_socket.dst, State),
     Eth = #eth { src=Socket#tcp_socket.mac, dst=DstMac,type=ipv4,data=Ip },
     transmit_frame(Eth, State),
     Socket.
@@ -1418,6 +1415,16 @@ transmit_ip(Socket, Proto, Data, State) ->
 transmit_frame(Frame, State) ->
     Data=enet_eth:encode(Frame, []),
     eth_devices:send(State#state.eth, Data).
+
+route_lookup(Dst, State) ->
+    case cache_lookup(Dst, State) of
+	false ->
+	    case dict:find(Dst, State#state.ipmac) of
+		error -> State#state.gw_mac; %% use the gateway mac
+		{ok,Mac} -> Mac
+	    end;
+	Mac -> Mac
+    end.
 
 random_32() ->
     <<X:32>> = crypto:rand_bytes(4),
@@ -1616,13 +1623,28 @@ insert_cache({0,0,0,0}, _, State) -> State;
 insert_cache({0,0,0,0,0,0,0,0}, _, State) -> State;
 insert_cache(IP, Mac, State) ->
     IPMac = dict:store(IP, Mac, State#state.cache),
-    State#state { cache = IPMac }.
+    GwMac = if State#state.gw =:= IP -> 
+		    io:format("gateway ~w mac set = ~w\n", [IP,Mac]),
+		    Mac;
+	       true -> State#state.gw_mac
+	    end,
+    State#state { cache = IPMac, gw_mac=GwMac }.
 
 cache_lookup(IP, State) ->
     case dict:find(IP, State#state.cache) of
 	{ok,Mac} -> Mac;
-	error -> ?BROADCAST   %% signal that arp is needed (or route)
+	error -> false
     end.
+
+send_arp(Op,SenderMac,TargetMac,SenderIP,TargetIP,State) ->
+    {PType,PLen} = if tuple_size(SenderIP) =:= 4 -> {ipv4, 4};
+		      tuple_size(SenderIP) =:= 8 -> {ipv6, 16}
+		   end,
+    transmit_arp(?BROADCAST,State#state.mac,
+		 #arp { op=Op, htype=ethernet, ptype=PType,
+			haddrlen = 6, paddrlen = PLen,
+			sender={SenderMac,SenderIP},
+			target={TargetMac,TargetIP}}, State).
 
 
 %% debug transmit:
