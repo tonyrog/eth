@@ -25,8 +25,8 @@
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
 	 terminate/2, code_change/3]).
 
--define(dbg(F,A), io:format("~s:~w: "++(F)++"\r\n",[?FILE,?LINE|(A)])).
-%% -define(dbg(F,A), ok).
+-define(debug(F,A), io:format("~s:~w: "++(F)++"\r\n",[?FILE,?LINE|(A)])).
+%% -define(debug(F,A), ok).
 -compile(export_all).
 
 -include_lib("enet/include/enet_types.hrl").
@@ -39,6 +39,18 @@
 -define(IPV6_HEADER_MIN_LEN,  40).
 -define(TCP_IPV4_HEADER_MIN_LEN, (?IPV4_HEADER_MIN_LEN+?TCP_HEADER_MIN_LEN)).
 -define(TCP_IPV6_HEADER_MIN_LEN, (?IPV6_HEADER_MIN_LEN+?TCP_HEADER_MIN_LEN)).
+
+-define(IPV4_MIN_SIZE, 576).
+-define(IPV6_MIN_SIZE, 576).
+-define(TCP_DEFAULT_IPV4_MSS, (?IPV4_MIN_SIZE - ?TCP_IPV4_HEADER_MIN_LEN)).
+-define(TCP_DEFAULT_IPV6_MSS, (?IPV6_MIN_SIZE - ?TCP_IPV4_HEADER_MIN_LEN)).
+
+%% linux define TCP_MIN_MSS as 88 (strange why?) a lot of stange ideas
+%% and magic on the internet :-)
+-define(TCP_TINY_MSS, 88). %% MSS used for testing. (10=timestamp,4=data)
+-define(TCP_TINY_MSS, 14). %% MSS used for testing. (10=timestamp,4=data)
+%% -define(TCP_TINY_MSS, 14). %% MSS used for testing. (10=timestamp,4=data)
+%% mac os x set minmss with sysctl = default 216
 
 -type socket_key() ::
 	{ tcp, ip_address(), port_no() } | %% listen "socket"
@@ -68,19 +80,12 @@
 	?TCP_FIN_WAIT1 | ?TCP_FIN_WAIT2 | ?TCP_CLOSING  | ?TCP_TIME_WAIT |
 	?TCP_CLOSE_WAIT | ?TCP_LAST_ACK  | ?TCP_CLOSED.
 
-
-%%
-%% input stream window = wsize*(1<<wscale ) our own anounced input size
-%%
-%% output stream window = wsize*(1<<wscale) other sides input size
-%%                        as used for transmission
-
--define(is_segment(X),
+-define(is_block(X),
 	(is_binary((X)) orelse is_reference((X)) orelse ((X) =:= ?FIN))).
 
 -type sdata() :: ?FIN | reference() | binary().
 
--record(segment,
+-record(block,
 	{
 	  seq :: uint32(),
 	  status = none :: none | send | waitack | ack,
@@ -89,13 +94,13 @@
 
 -record(stream,
 	{
-	  window=65535,          %% current announced window size
+	  window=65535 :: non_neg_integer(), %% current announced window size
+	  wscale = 0 :: 0..14,   %% wscale if supported
 	  mss :: uint16(),       %% maximum segment size used
 	  bytes = 0 :: uint32(), %% number bytes sent / received in window
 	  seq = 0 :: uint32(),   %% current seqeuence number
 	  closed = false :: pushed | boolean(),
-	  %% unacked output segments / undelivered input segments
-	  segments = []  :: [#segment{}]
+	  blocks = []  :: [#block{}]
 	}).
 
 -record(lst_socket,  %% listen sockets
@@ -112,7 +117,22 @@
 	  aqueue = [] :: [{reference(),pid()}]   %% accept queue
 	}).
 
-%% RFC 6298, 1323
+%% http://en.wikipedia.org/wiki/Transmission_Control_Protocol
+%% 
+%% flags for tcp option support (roughly the option number as a bit)
+-define(TCP_OPT_NONE,         16#0000).
+
+%% RFC 793 - TRANSMISSION CONTROL PROTOCOL
+%% RFC 879 - TCP Options and Maximum Segment Size (MSS)
+-define(TCP_OPT_MSS,          16#0004).  %% (1 bsl 2), Kind = 2
+%% SACK - RFC 2018 - Kind = 4 (+ 5)
+-define(TCP_OPT_SACK,         16#0010).  %% (1 bsl 4), Kind = 4
+%% RFC 1323 - TCP Extensions for High Performance
+-define(TCP_OPT_WSCALE,       16#0008).  %% (1 bsl 3), Kind = 3
+-define(TCP_OPT_TIMESTAMP,    16#0100).  %% (1 bsl 8), Kind = 8
+
+-type tcp_syn_options() :: uint16().
+
 -define(MIN_RTO, 1.0).
 -define(MAX_RTO, 60.0).
 -define(START_RTO, 1.0).
@@ -132,6 +152,7 @@
 	  src_port :: port_no(),
 	  dst_port :: port_no(),
 	  owner    :: pid(),
+	  tcp_opts  :: tcp_syn_options(), %% flags
 	  tsecr = 0 :: non_neg_integer(), %% timestamp echo reply
 	  rto = ?START_RTO :: float(),    %% retransmit timeout
 	  srtt      :: float(),
@@ -155,6 +176,8 @@
 
 -type socket() :: #tcp_socket{} | #udp_socket{} | #lst_socket{}.
 
+-define(DEFAULT_TCP_OPTIONS,
+	?TCP_OPT_MSS bor ?TCP_OPT_TIMESTAMP).	
 
 -record(state,
 	{
@@ -162,6 +185,10 @@
 	  eth,       %% interface handler
 	  mtu,       %% mtu size of interface / minimum mtu usable
 	  mac :: ethernet_address(),       %% the mac address on interface
+	  %% options offered & allowed in syn packets
+	  tcp_opts = ?DEFAULT_TCP_OPTIONS :: tcp_syn_options(),
+	  wscale  = 0,                 %% window scaling when supported
+	  tiny_mss = true,             %% debug test very small segments
 	  ipmac :: dict:dict(ip_address(),ethernet_address()),
 	  macs :: sets:set(ethernet_address()),
 	  cache :: dict:dict(ip_address(),ethernet_address()),
@@ -172,6 +199,7 @@
 -define(u32(X), ((X)  band 16#ffffffff)).
 -define(seq_next(X), ?u32((X)+1)).
 -define(seq_lte(X,Y), (?u32((Y)-(X)) < 16#40000000)).
+-define(seq_lt(X,Y), (?u32((Y)-(X)-1) < 16#40000000)).
 
 %%%===================================================================
 %%% API
@@ -212,8 +240,8 @@ tcp_connect(Net, SrcIP, SrcPort, DstIP, DstPort, Options) ->
 
 %% send binary data or if a list of binaries, send each binary as
 %% one or more segments.
-tcp_send(Net, TcpRef, Data) when ?is_segment(Data);
-				 ?is_segment(hd(Data)) ->
+tcp_send(Net, TcpRef, Data) when ?is_block(Data);
+				 ?is_block(hd(Data)) ->
     gen_server:call(Net, {tcp_send, TcpRef, Data}).
 
 %% send FIN and terminate gracefully
@@ -328,7 +356,7 @@ handle_call({udp_close,Ref}, _From, State) ->
 	    {Reply,State1} = close_session(SockKey,State),
 	    {reply, Reply, State1};
 	{ok, _SockKey} ->
-	    ?dbg("try to udp_close on ~w", [_SockKey]),
+	    ?debug("try to udp_close on ~w", [_SockKey]),
 	    {reply, {error, einval},  State}
     end;
 handle_call({udp_send,Ref,DstIP,DstPort,Data}, _From, State) ->
@@ -389,13 +417,16 @@ handle_call({tcp_connect,Owner,SrcIP,SrcPort,DstIP,DstPort,_Options},
 		    {reply, {error, einval}, State};
 		{ok,SrcMac} ->
 		    Ref = erlang:monitor(process, Owner),
-		    Mss = calc_mss(SrcIP, State),
-		    Ostream = #stream { mss=Mss, seq=random_32() },
-		    Istream = #stream {},
-		    Socket = #tcp_socket { ref=Ref, key=Key, mac = SrcMac,
+		    OMss = default_mss(SrcIP, State),
+		    IMss = calc_mss(SrcIP, State),
+		    Ostream = #stream { mss=OMss, seq=random_32() },
+		    Istream = #stream { mss=IMss, wscale=State#state.wscale },
+		    Socket = #tcp_socket { ref=Ref, key=Key,
+					   tcp_state = ?TCP_SYN_SENT,
+					   mac = SrcMac,
 					   src = SrcIP,src_port = SrcPort,
 					   dst = DstIP,dst_port = DstPort,
-					   tcp_state = ?TCP_SYN_SENT,
+					   tcp_opts = State#state.tcp_opts,
 					   ostream = Ostream,
 					   istream = Istream,
 					   owner = Owner },
@@ -429,7 +460,7 @@ handle_call({tcp_shutdown,Ref}, _From, State) ->
 	    {Reply,State1} = close_session(SockKey,State),
 	    {reply, Reply, State1};
 	{ok, _SockKey} ->
-	    ?dbg("try to tcp_close on ~w", [_SockKey]),
+	    ?debug("try to tcp_close on ~w", [_SockKey]),
 	    {reply, {error, einval},  State}
     end;
 
@@ -448,7 +479,7 @@ handle_call({tcp_close,Ref}, _From, State) ->
 	    {Reply,State1} = close_session(Key,State),
 	    {reply, Reply, State1};
 	{ok, _SockKey} ->
-	    ?dbg("try to tcp_close on ~w", [_SockKey]),
+	    ?debug("try to tcp_close on ~w", [_SockKey]),
 	    {reply, {error, einval},  State}
     end;
 
@@ -533,7 +564,7 @@ handle_info({tcp,Ref,Data}, State) ->
 	    State1 = store_socket(Socket1,State),
 	    {noreply, State1};
 	Error ->
-	    ?dbg("unable to queue segments: ~p", [Error]),
+	    ?debug("unable to queue segments: ~p", [Error]),
 	    {noreply, State}
     end;
 handle_info({timeout,_TRef,{close,Ref}}, State) ->
@@ -543,7 +574,7 @@ handle_info({timeout,_TRef,{close,Ref}}, State) ->
 	    case dict:find(Key,State#state.sockets) of
 		error -> {noreply, State};
 		{ok,Socket=#tcp_socket{tcp_state=?TCP_TIME_WAIT}} ->
-		    ?dbg("time_wait done killing socket ~p", [Socket]),
+		    ?debug("time_wait done killing socket ~p", [Socket]),
 		    State1 = erase_socket(Socket, State),
 		    {noreply,State1};
 		{ok,_} ->
@@ -557,7 +588,7 @@ handle_info({close,Ref}, State) ->
 	    State1 = store_socket(Socket1,State),
 	    {noreply, State1};
 	Error ->
-	    ?dbg("unable to queue fin segments: ~p", [Error]),
+	    ?debug("unable to queue fin segments: ~p", [Error]),
 	    {noreply, State}
     end;
 
@@ -576,7 +607,7 @@ handle_info({'DOWN', Ref, process, _Pid, _Reason}, State) ->
 	    {noreply, State1}
     end;
 handle_info(_Info, State) ->
-    ?dbg("got info: ~p", [_Info]),
+    ?debug("got info: ~p", [_Info]),
     {noreply, State}.
 
 terminate(_Reason, _State) ->
@@ -619,7 +650,7 @@ store_socket(Socket, State) ->
 close_listen_socket(Ref, SockKey, State) ->
     case dict:find(SockKey, State#state.sockets) of
 	{ok,Socket} -> %% close queued accepter processes
-	    ?dbg("closing socket ~p", [Socket]),
+	    ?debug("closing socket ~p", [Socket]),
 	    SockRef1 = lists:foldl(
 			 fun({ARef,Pid},SockRef) ->
 				 Pid ! {tcp_closed,ARef},
@@ -636,7 +667,7 @@ close_accept_socket(Ref, _SockKey={tcp_a,IP,Port}, State) ->
     LKey={tcp,IP,Port},
     case dict:find(LKey, State#state.sockets) of
 	{ok,Socket} ->  %% close one acceptor process
-	    ?dbg("closing accept on socket ~p", [Socket]),
+	    ?debug("closing accept on socket ~p", [Socket]),
 	    AQueue = Socket#lst_socket.aqueue,
 	    case lists:keytake(1,Ref,AQueue) of
 		false ->
@@ -674,7 +705,7 @@ close_session(Key, State) ->
 	       Socket#tcp_socket.tcp_state =:= ?TCP_CLOSING ->
 		    {{error,einprogress}, State};
 	       true ->
-		    ?dbg("killing socket ~p", [Socket]),
+		    ?debug("killing socket ~p", [Socket]),
 		    State1 = erase_socket(Socket, State),
 		    {ok, State1}
 	    end
@@ -688,7 +719,7 @@ handle_frame(Eth=#eth { data = IP = #ipv4 {}}, State) ->
     State1 = insert_cache(IP#ipv4.src, Eth#eth.src, State),
     handle_ipv4(IP,Eth,State1);
 handle_frame(_Frame, State) ->
-    ?dbg("handle_frame: not handled: ~s", [eth_packet:fmt_erl(_Frame)]),
+    ?debug("handle_frame: not handled: ~s", [eth_packet:fmt_erl(_Frame)]),
     State.
 
 handle_ipv4(IP=#ipv4 { data = Icmp = #icmp{} }, Eth, State) ->
@@ -713,7 +744,7 @@ handle_ipv4(IP=#ipv4 { data = Tcp = #tcp{} }, Eth, State) ->
 	    handle_tcp(Tcp, IP, Eth, State)
     end;
 handle_ipv4(_IP, _Eth, State) ->
-    ?dbg("handle_ipv4: not handled: ~s", [eth_packet:fmt_erl(_IP)]),
+    ?debug("handle_ipv4: not handled: ~s", [eth_packet:fmt_erl(_IP)]),
     State.
 
 handle_icmp(#icmp { type=echo_request,id=ID,seq=Seq,data=Data},IP,Eth,State) ->
@@ -723,14 +754,14 @@ handle_icmp(#icmp { type=echo_request,id=ID,seq=Seq,data=Data},IP,Eth,State) ->
     transmit_frame(Eth1, State),
     State;
 handle_icmp(_Icmp,_IP,_Eth,State) ->
-    ?dbg("handle_icmp: not handled: ~s", [eth_packet:fmt_erl(_Icmp)]),
+    ?debug("handle_icmp: not handled: ~s", [eth_packet:fmt_erl(_Icmp)]),
     State.
 
 handle_udp(_Udp=#udp { src_port = SrcPort, dst_port = DstPort, data=Data },
 	   IP, _Eth, State) ->
     case dict:find({udp,IP#ipv4.dst,DstPort},State#state.sockets) of
 	error ->
-	    ?dbg("handle_udp: not handled: ~s", [eth_packet:fmt_erl(_Udp)]),
+	    ?debug("handle_udp: not handled: ~s", [eth_packet:fmt_erl(_Udp)]),
 	    %% icmp error?
 	    State;
 	{ok,#udp_socket{ref=Ref,owner=Pid}} ->
@@ -738,7 +769,7 @@ handle_udp(_Udp=#udp { src_port = SrcPort, dst_port = DstPort, data=Data },
 	    State
     end;
 handle_udp(_Udp,_IP,_Eth,State) ->
-    ?dbg("handle_udp: not handled: ~s", [eth_packet:fmt_erl(_Udp)]),
+    ?debug("handle_udp: not handled: ~s", [eth_packet:fmt_erl(_Udp)]),
     State.
 
 
@@ -750,7 +781,7 @@ handle_tcp(Tcp=#tcp { src_port = SrcPort, dst_port = DstPort },
 	    LKey = {tcp,IP#ipv4.dst,DstPort},
 	    case dict:find(LKey,State#state.sockets) of
 		error ->
-		    ?dbg("handle_tcp: not handled: ~s",
+		    ?debug("handle_tcp: not handled: ~s",
 			 [eth_packet:fmt_erl(Tcp)]),
 		    %% icmp error?
 		    State;
@@ -766,56 +797,59 @@ handle_tcp(Tcp=#tcp { src_port = SrcPort, dst_port = DstPort },
 	    end;
 	{ok,Socket} ->
 	    log_tcp(Socket, Tcp, "<"),
-	    case tcp_fsm(Socket#tcp_socket.tcp_state,Socket,Tcp,IP,Eth,State) of
+	    Socket1 = handle_timestamp(Socket, Tcp),
+	    case tcp_fsm(Socket1#tcp_socket.tcp_state,Socket1,
+			 Tcp,IP,Eth,State) of
 		false ->
 		    State;
 		undefined ->
-		    ?dbg("killing socket ~p", [Socket]),
+		    ?debug("killing socket ~p", [Socket]),
 		    erase_socket(Socket, State);
-		Socket1 ->
-		    store_socket(Socket1, State)
+		Socket2 ->
+		    store_socket(Socket2, State)
 	    end
     end;
 handle_tcp(_Tcp,_IP,_Eth,State) ->
-    ?dbg("handle_tcp: not handled: ~s", [eth_packet:fmt_erl(_Tcp)]),
+    ?debug("handle_tcp: not handled: ~s", [eth_packet:fmt_erl(_Tcp)]),
     State.
 
-%% Handle SYN packets when someone is willing to accept. fixme flow control!
 handle_accept(LSocket,Tcp,IP,Eth,State) ->
     case Tcp of
 	#tcp { urg=false,ack=false,psh=false,rst=false,syn=true,fin=false,
-	       window=Wsize,options=Options,data= <<>> } ->
+	       window=Wsize,options=TcpOptions,data= <<>> } ->
 	    case LSocket#lst_socket.aqueue of
 		[{Ref,Pid}|AQueue] ->
 		    Key = {tcp,IP#ipv4.dst,Tcp#tcp.dst_port,
 			   IP#ipv4.src,Tcp#tcp.src_port},
-		    Mss = calc_mss(IP#ipv4.dst, State),
-		    Wscale = proplists:get_value(window_size_shift,Options,0),
-		    Window = wss_to_window(Wsize,Wscale),
-		    Ostream = #stream { window=Window,mss=Mss,seq=random_32() },
-		    Istream = #stream { seq=?seq_next(Tcp#tcp.seq_no) },
-
+		    %% unless mss option is used this is what we use for sending
+		    IMss = default_mss(IP#ipv4.dst,State),
+		    OMss = calc_mss(IP#ipv4.dst,State), %% send this if mss
+		    Ostream = #stream { window=Wsize,mss=OMss,seq=random_32() },
+		    Istream = #stream { mss=IMss,seq=?seq_next(Tcp#tcp.seq_no)},
 		    Socket = #tcp_socket { ref=Ref, key=Key, mac=Eth#eth.dst,
 					   src = IP#ipv4.dst,
 					   src_port=Tcp#tcp.dst_port,
 					   dst = IP#ipv4.src,
 					   dst_port = Tcp#tcp.src_port,
 					   tcp_state = ?TCP_SYN_RCVD,
+					   tcp_opts = State#state.tcp_opts,
+					   tsecr = 0,
 					   owner = Pid,
 					   istream = Istream,
 					   ostream = Ostream
 					 },
-		    ?dbg("socket syn_rcvd = ~w", [Socket]),
-		    Socket1 = transmit_syn_ack(Socket,State),
+		    Socket1 = accept_syn_options(TcpOptions,Socket,State),
+		    ?debug("socket syn_rcvd = ~w", [Socket1]),
+		    Socket2 = transmit_syn_ack(Socket1,State),
 		    LSocket1 = LSocket#lst_socket { aqueue = AQueue },
-		    {LSocket1,Socket1};
+		    {LSocket1,Socket2};
 		[] ->
-		    ?dbg("handle_tcp_input(listen): no acceptor:\n~s\n",
+		    ?debug("handle_tcp_input(listen): no acceptor:\n~s\n",
 			 [eth_packet:fmt_erl(Tcp)]),
 		    false
 	    end;
 	_ ->
-	    ?dbg("handle_tcp_input(listen): tcp dropped:\n~s\n",
+	    ?debug("handle_tcp_input(listen): tcp dropped:\n~s\n",
 		 [eth_packet:fmt_erl(Tcp)]),
 	    false
     end.
@@ -824,46 +858,41 @@ handle_accept(LSocket,Tcp,IP,Eth,State) ->
 %% tcp_fsm - tcp state machine
 %%
 tcp_fsm(?TCP_SYN_RCVD,Socket=#tcp_socket{istream=Istream,ostream=Ostream},
-	Tcp,IP,_Eth,_State) ->
+	Tcp,_IP,_Eth,_State) ->
     case Tcp of
 	#tcp { seq_no=Seq,ack_no=AckNo,urg=false,ack=true,psh=false,
 	       rst=false,syn=false,fin=false,
-	       window=Wsize,options=Options,data= <<>> } when
+	       window=Wsize,options=_TcpOptions,data= <<>> } when
 	      AckNo =:= ?seq_next(Ostream#stream.seq) ->
-	    tcp_report_connected(Socket, IP#ipv4.src, Tcp#tcp.src_port),
-	    Wscale = proplists:get_value(window_size_shift,Options,0),
-	    Window = wss_to_window(Wsize,Wscale),
+	    tcp_report_connected(Socket),
+	    Window = Wsize bsl Istream#stream.wscale,
 	    Ostream1 = Ostream#stream {	seq=AckNo, window=Window },
-	    Istream1 = Istream#stream { seq=Seq }, %% ?seq_next(Seq) },
+	    Istream1 = Istream#stream { seq=Seq },
 	    Socket#tcp_socket { tcp_state = ?TCP_ESTABLISHED,
 				istream = Istream1,
 				ostream = Ostream1 };
 	_ ->
-	    ?dbg("tcp_fsm(syn_rcvd): tcp dropped:\n~s\n",
+	    ?debug("tcp_fsm(syn_rcvd): tcp dropped:\n~s\n",
 		 [eth_packet:fmt_erl(Tcp)]),
 	    false
     end;
 tcp_fsm(?TCP_SYN_SENT,Socket=#tcp_socket{ istream=Istream, ostream=Ostream },
-	Tcp,IP,_Eth,State) ->
+	Tcp,_IP,_Eth,State) ->
     case Tcp of
 	#tcp { seq_no=Seq,ack_no=AckNo,urg=false,ack=true,psh=false,
 	       rst=false,syn=true,fin=false,
-	       window=Wsize,options=Options,data= <<>> } when
+	       window=Wsize,options=TcpOptions,data= <<>> } when
 	      AckNo =:= ?seq_next(Ostream#stream.seq) ->
-	    tcp_report_connected(Socket, IP#ipv4.src, Tcp#tcp.src_port),
-	    Mss = proplists:get_value(mss, Options,
-				      1500-?TCP_IPV4_HEADER_MIN_LEN),
-	    Wscale = proplists:get_value(window_size_shift,Options,0),
-	    Window = wss_to_window(Wsize,Wscale),
-	    Ostream1 = Ostream#stream { seq=AckNo },
-	    Istream1 = Istream#stream { window=Window,mss=Mss,bytes=0,
-					seq=?seq_next(Seq), segments=[]},
+	    tcp_report_connected(Socket),
+	    Ostream1 = Ostream#stream { seq=AckNo, window=Wsize },
+	    Istream1 = Istream#stream { bytes=0,seq=?seq_next(Seq),blocks=[]},
 	    Socket1 = Socket#tcp_socket { tcp_state = ?TCP_ESTABLISHED,
 					  ostream=Ostream1,
 					  istream=Istream1 },
-	    transmit_ack(Socket1,State);
+	    Socket2 = accept_syn_options(TcpOptions,Socket1,State),
+	    transmit_ack(Socket2,State);
 	_ ->
-	    ?dbg("tcp_fsm(syn_sent): tcp dropped:\n~s\n",
+	    ?debug("tcp_fsm(syn_sent): tcp dropped:\n~s\n",
 		 [eth_packet:fmt_erl(Tcp)]),
 	    false
     end;
@@ -872,10 +901,9 @@ tcp_fsm(?TCP_ESTABLISHED, Socket=#tcp_socket{ istream=Istream,ostream=Ostream },
     case Tcp of
 	#tcp { seq_no=Seq,ack_no=AckNo,urg=false,ack=Ack,psh=_IsPsh,
 	       rst=false,syn=false,fin=Fin,
-	       window=Wsize,options=Options,data=Data } ->
-	    Ostream1 = ack_output_data(Ack, AckNo, Socket, Ostream),
-	    %% FIXME: a lot of code here for handling out-of-order
-	    %%        reception, sack etc.
+	       window=Wsize,options=_TcpOptions,data=Data } ->
+	    %% fixme: handle SACK
+	    Ostream0 = ack_output_data(Ack, AckNo, Socket, Ostream),
 	    if Seq =:= Istream#stream.seq ->
 		    Len = byte_size(Data),
 		    tcp_report_data(Socket, Data),
@@ -883,13 +911,11 @@ tcp_fsm(?TCP_ESTABLISHED, Socket=#tcp_socket{ istream=Istream,ostream=Ostream },
 					 ?TCP_CLOSE_WAIT;
 				  true -> ?TCP_ESTABLISHED
 			       end,
-		    Wscale = proplists:get_value(window_size_shift,Options,0),
-		    Window = wss_to_window(Wsize,Wscale),
+		    Window = Wsize bsl Istream#stream.wscale,
 		    ISeq = if Fin -> ?u32(Seq+Len+1); true -> ?u32(Seq+Len) end,
-		    Istream1 = Istream#stream { window=Window,
-						closed=Fin,
-						seq=ISeq,
-						segments=[] },
+		    Istream1 = Istream#stream { closed=Fin,
+						seq=ISeq,blocks=[] },
+		    Ostream1 = Ostream0#stream { window=Window },
 		    Socket1 = Socket#tcp_socket { tcp_state=TcpState,
 						  ostream=Ostream1,
 						  istream=Istream1 },
@@ -908,11 +934,11 @@ tcp_fsm(?TCP_ESTABLISHED, Socket=#tcp_socket{ istream=Istream,ostream=Ostream },
 		    %% Ack last known sequence number
 		    io:format("istrem.seq=~w mismatch seq=~w\n",
 			      [Istream#stream.seq, Seq]),
-		    Socket1 = Socket#tcp_socket { ostream=Ostream1 },
+		    Socket1 = Socket#tcp_socket { ostream=Ostream0 },
 		    send_data(Socket1,State)
 	    end;
 	_ ->
-	    ?dbg("tcp_fsm(established): tcp dropped:\n~s\n",
+	    ?debug("tcp_fsm(established): tcp dropped:\n~s\n",
 		 [eth_packet:fmt_erl(Tcp)]),
 	    false
     end;
@@ -938,9 +964,8 @@ tcp_fsm(?TCP_FIN_WAIT1, Socket=#tcp_socket{ istream=Istream, ostream=Ostream},
 			      tcp_report_closed(Socket,Fin),
 			      ISeq = if Fin -> ?u32(Seq+Len+1);
 					true -> ?u32(Seq+Len) end,
-			      Istream1 = Istream#stream { seq=ISeq,
-							  closed=Fin,
-							  segments=[] },
+			      Istream1 = Istream#stream { seq=ISeq,closed=Fin,
+							  blocks=[] },
 			      Socket#tcp_socket { tcp_state=TcpState,
 						  ostream=Ostream1,
 						  istream=Istream1 };
@@ -957,7 +982,7 @@ tcp_fsm(?TCP_FIN_WAIT1, Socket=#tcp_socket{ istream=Istream, ostream=Ostream},
 		    transmit_ack(Socket1,State)
 	    end;
 	_ ->
-	    ?dbg("tcp_fsm(fin_wait1): tcp dropped:\n~s\n",
+	    ?debug("tcp_fsm(fin_wait1): tcp dropped:\n~s\n",
 		 [eth_packet:fmt_erl(Tcp)]),
 	    false
     end;
@@ -973,7 +998,7 @@ tcp_fsm(?TCP_FIN_WAIT2,Socket=#tcp_socket{istream=Istream},
 		    start_msl_timer(Socket),
 		    tcp_report_closed(Socket),
 		    Istream1 = Istream#stream { seq=ISeq,closed=true,
-						segments=[] },
+						blocks=[] },
 		    Socket1 = Socket#tcp_socket { tcp_state=TcpState,
 						  istream=Istream1 },
 		    transmit_ack(Socket1,State);
@@ -984,7 +1009,7 @@ tcp_fsm(?TCP_FIN_WAIT2,Socket=#tcp_socket{istream=Istream},
 		    false
 	    end;
 	_ ->
-	    ?dbg("tcp_fsm(fin_wait2): tcp dropped:\n~s\n",
+	    ?debug("tcp_fsm(fin_wait2): tcp dropped:\n~s\n",
 		 [eth_packet:fmt_erl(Tcp)]),
 	    false
     end;
@@ -1000,14 +1025,14 @@ tcp_fsm(?TCP_CLOSING,Socket=#tcp_socket{ostream=Ostream},
 		    Socket#tcp_socket { tcp_state = ?TCP_TIME_WAIT,
 					ostream = Ostream1 };
 	       true ->
-		    ?dbg("tcp_fsm(closing): (seq=~w) tcp dropped:\n~s\n",
+		    ?debug("tcp_fsm(closing): (seq=~w) tcp dropped:\n~s\n",
 			 [Ostream#stream.seq, eth_packet:fmt_erl(Tcp)]),
 		    Socket#tcp_socket { ostream = Ostream1 }
 	    end
     end;
 tcp_fsm(?TCP_TIME_WAIT,#tcp_socket{ostream=Ostream},
 	Tcp,_IP,_Eth,_State) ->
-    ?dbg("tcp_fsm(time_wait): (seq=~w) tcp dropped:\n~s\n",
+    ?debug("tcp_fsm(time_wait): (seq=~w) tcp dropped:\n~s\n",
 	 [Ostream#stream.seq, eth_packet:fmt_erl(Tcp)]),
     false;
 tcp_fsm(?TCP_CLOSE_WAIT,Socket=#tcp_socket{ostream=Ostream},
@@ -1023,7 +1048,7 @@ tcp_fsm(?TCP_CLOSE_WAIT,Socket=#tcp_socket{ostream=Ostream},
 		    Socket1#tcp_socket { tcp_state=?TCP_LAST_ACK }
 	    end;
 	_ ->
-	    ?dbg("tcp_fsm(close_wait): (seq=~w) tcp dropped:\n~s\n",
+	    ?debug("tcp_fsm(close_wait): (seq=~w) tcp dropped:\n~s\n",
 		 [Ostream#stream.seq, eth_packet:fmt_erl(Tcp)]),
 	    false
     end;
@@ -1036,12 +1061,12 @@ tcp_fsm(?TCP_LAST_ACK,_Socket=#tcp_socket{ostream=Ostream},
 	      AckNo =:= Ostream#stream.seq ->
 	    undefined; %% done
 	_ ->
-	    ?dbg("tcp_fsm(last_ack): (seq=~w) tcp dropped:\n~s\n",
+	    ?debug("tcp_fsm(last_ack): (seq=~w) tcp dropped:\n~s\n",
 		 [Ostream#stream.seq, eth_packet:fmt_erl(Tcp)]),
 	    false
     end;
 tcp_fsm(TcpState,Socket,Tcp,_IP,_Eth,_State) ->
-    ?dbg("tcp_fsm(~s): (seq=~w) not handled:\n~s\n",
+    ?debug("tcp_fsm(~s): (seq=~w) not handled:\n~s\n",
 	 [TcpState,(Socket#tcp_socket.ostream)#stream.seq,
 	  eth_packet:fmt_erl(Tcp)]),
     false.
@@ -1060,7 +1085,7 @@ tcp_report_closed(Socket) ->
 tcp_report_event(Socket,Event) ->
     Socket#tcp_socket.owner ! {tcp_event, Socket#tcp_socket.ref, Event}.
 
-tcp_report_connected(Socket, IP, Port) ->
+tcp_report_connected(Socket=#tcp_socket{dst=IP, dst_port=Port}) ->
     Socket#tcp_socket.owner ! {tcp_connected, Socket#tcp_socket.ref, IP, Port}.
 
 tcp_report_data(_Socket, <<>>) -> %% do not report empty segments
@@ -1073,7 +1098,7 @@ tcp_report_data(Socket, Data) ->
 handle_arp(_Arp=#arp { op = reply,
 		       sender = {SenderMac, SenderIP},
 		       target = {TargetMac, TargetIP}},_Eth,State) ->
-    ?dbg("cache arp: ~s", [eth_packet:fmt_erl(_Arp)]),
+    ?debug("cache arp: ~s", [eth_packet:fmt_erl(_Arp)]),
     %% cache only on reply and gratuitous arp?
     State1 = insert_cache(SenderIP, SenderMac, State),
     State2 = insert_cache(TargetIP, TargetMac, State1),
@@ -1081,7 +1106,7 @@ handle_arp(_Arp=#arp { op = reply,
 handle_arp(Arp=#arp { op = request,
 		      sender = {SenderMac, SenderIP},
 		      target = {TargetMac, TargetIP}},Eth,State) ->
-    ?dbg("handle arp request: ~s", [eth_packet:fmt_erl(Arp)]),
+    ?debug("handle arp request: ~s", [eth_packet:fmt_erl(Arp)]),
     case (TargetMac =:= ?ZERO) orelse
 	sets:is_element(TargetMac,State#state.macs) of
 	true ->
@@ -1089,7 +1114,7 @@ handle_arp(Arp=#arp { op = request,
 		error ->
 		    State;
 		{ok,TargetMac1} ->
-		    ?dbg("handle arp reply with mac=~w", [TargetMac1]),
+		    ?debug("handle arp reply with mac=~w", [TargetMac1]),
 		    transmit_arp(Eth#eth.src,Eth#eth.dst,
 				 Arp#arp { op=reply,
 					   sender={TargetMac1,TargetIP},
@@ -1100,34 +1125,33 @@ handle_arp(Arp=#arp { op = request,
 	    State
     end;
 handle_arp(Arp,_Eth,State) ->
-    ?dbg("handle_arp: not handled: ~p", [Arp]),
+    ?debug("handle_arp: not handled: ~p", [Arp]),
     State.
 
 %% Handle ack of output data (fixme handle sack)
 ack_output_data(true,AckNo,Socket,Ostream) ->
-    ack_segments(Ostream#stream.segments,AckNo,Socket,Ostream);
+    ack_blocks(Ostream#stream.blocks,AckNo,Socket,Ostream);
 ack_output_data(false,_AckNo,_Socket,Ostream) ->
     Ostream.
 
-ack_segments(Segments0=[#segment{seq=Seq,data=Data}|Segments],
-	     AckNo,Socket,Stream) ->
+ack_blocks(Bs0=[#block{seq=Seq,data=Data}|Bs],AckNo,Socket,Stream) ->
     Seq1 = ?u32(Seq+segment_size(Data)),
     case ?seq_lte(Seq1, AckNo) of
 	true ->
 	    if is_reference(Data) ->
 		    tcp_report_event(Socket,Data),
-		    ack_segments(Segments,AckNo,Socket,Stream);
+		    ack_blocks(Bs,AckNo,Socket,Stream);
 	       Data =:= ?FIN ->
 		    Stream1 = Stream#stream { closed = true },
-		    ack_segments(Segments,AckNo,Socket,Stream1);
+		    ack_blocks(Bs,AckNo,Socket,Stream1);
 	       true ->
-		    ack_segments(Segments,AckNo,Socket,Stream)
+		    ack_blocks(Bs,AckNo,Socket,Stream)
 	    end;
 	false ->
-	    Stream#stream { seq = AckNo, segments=Segments0 }
+	    Stream#stream { seq = AckNo, blocks=Bs0 }
     end;
-ack_segments([],AckNo,_Socket,Stream) ->
-    Stream#stream { seq = AckNo, segments=[] }.
+ack_blocks([],AckNo,_Socket,Stream) ->
+    Stream#stream { seq = AckNo, blocks=[] }.
 
 %% put data onto output segment queue
 %%   item() = binary() | 'fin' | reference()
@@ -1172,56 +1196,55 @@ enqueue_socket_data(_Socket,_Data) ->
 
 %% put data onto segments list
 
-enqueue_stream(Stream=#stream{closed=Closed,mss=Mss,segments=Segments},Data) ->
-    LastSeq = next_sequence_no(Stream),
-    try make_segment_list_(LastSeq, Mss, Closed, Data, [], []) of
-	{Closed1,MoreSegments} ->
-	    Segments1 = Segments++MoreSegments,
-	    {ok,Stream#stream { closed=Closed1,segments=Segments1}}
+enqueue_stream(Stream=#stream{seq=Seq0,closed=Closed,blocks=Bs0},Data) ->
+    {Seq,RBs} = case lists:reverse(Bs0) of
+		    [] -> {Seq0, []};
+		    RBs0=[#block{seq=Seq1}|_] -> {Seq1,RBs0}
+		end,
+    try enqueue_data_(Data,Seq,Closed,[],RBs) of
+	{Closed1,Bs1} ->
+	    {ok,Stream#stream {closed=Closed1,blocks=Bs1}}
     catch
-	error:_ ->  %% invalid data!
+	error:_ ->
 	    {error,einval}
     end.
 
-%% store this in stream?
-next_sequence_no(#stream { seq=Seq,segments=[] }) -> Seq;
-next_sequence_no(#stream { segments=Segments }) ->
-    #segment{seq=Seq,data=Data} = lists:last(Segments),
+%% handle list of data, not segments. The segments are split
+%% as late as possible to allow for various options lists.
+%% ack may split data list when handling selective acks.
+
+enqueue_data_([Data|Ds],Seq,Closed,Cont,Bs) ->
+    enqueue_data_(Data,Seq,Closed,[Ds|Cont],Bs);
+enqueue_data_([],Seq,Closed,Cont,Bs) ->
+    enqueue_data_cont_(Cont, Seq, Closed, Bs);
+enqueue_data_(Data,Seq,Closed,Cont,Bs) when is_binary(Data) ->
+    Seq1 = ?u32(Seq + byte_size(Data)),
+    B = #block{seq=Seq,status=send,data=Data},
+    enqueue_data_cont_(Cont, Seq1, Closed, [B|Bs]);
+enqueue_data_(Mark,Seq,Closed,Cont,Bs) when is_reference(Mark) ->
+    B = #block{seq=Seq,status=waitack,data=Mark},
+    enqueue_data_cont_(Cont, Seq, Closed, [B|Bs]);
+enqueue_data_(?FIN,Seq,_Closed,Cont,Bs) ->
+    B = #block{seq=Seq,status=send,data=?FIN},
+    enqueue_data_cont_(Cont, Seq, pushed, [B|Bs]).
+
+enqueue_data_cont_([],_Seq,Closed,Bs) ->
+    {Closed, lists:reverse(Bs)};
+enqueue_data_cont_([Data|Cont1],Seq,Closed,Bs) ->
+    enqueue_data_(Data,Seq,Closed,Cont1,Bs).
+
+left_sequence_no(#stream { seq=Seq,blocks=[] }) -> Seq;
+left_sequence_no(#stream { blocks=[#block{seq=Seq}|_] }) -> Seq.
+
+right_sequence_no(#stream { seq=Seq,blocks=[] }) -> Seq;
+right_sequence_no(#stream { blocks=Bs }) ->
+    #block{seq=Seq,data=Data} = lists:last(Bs),
     ?u32(Seq+segment_size(Data)).
 
 segment_size(Data) when is_binary(Data) -> byte_size(Data);
 segment_size(Data) when is_reference(Data) -> 0;
 segment_size(?FIN) -> 1.
 
-%% Handle lists of segment data. This version does not try to merge
-%% binaries because of testing purposes. User decide how segments are
-%% handled (may require to be able to read mss).
-
-make_segment_list_(Seq, Mss, Closed, Data, Cont, Acc) when
-      byte_size(Data) =< Mss ->
-    Seq1 = ?u32(Seq + segment_size(Data)),
-    Segment = #segment { seq=Seq, status=send, data=Data},
-    make_segment_list_cont_(Seq1, Mss, Closed, Cont, [Segment|Acc]);
-make_segment_list_(Seq, Mss, Closed, Data, Cont, Acc) when is_binary(Data) ->
-    {Data1,Rest} = erlang:split_binary(Data, Mss),
-    Seq1 = ?u32(Seq + Mss),
-    Segment = #segment { seq=Seq, status=send, data=Data1},
-    make_segment_list_(Seq1, Mss, Closed, Rest, Cont, [Segment|Acc]);
-make_segment_list_(Seq, Mss, Closed, [Data|Ds], Cont, Acc) ->
-    make_segment_list_(Seq, Mss, Closed, Data, [Ds|Cont], Acc);
-make_segment_list_(Seq, Mss, Closed, [], Cont, Acc) ->
-    make_segment_list_cont_(Seq, Mss, Closed, Cont, Acc);
-make_segment_list_(Seq, Mss, Closed, Mark, Cont, Acc) when is_reference(Mark) ->
-    Segment = #segment { seq=Seq, status=waitack, data=Mark},
-    make_segment_list_cont_(Seq, Mss, Closed, Cont, [Segment|Acc]);
-make_segment_list_(Seq, Mss, _Closed, ?FIN, Cont, Acc) ->
-    Segment = #segment { seq=Seq, status=send, data=?FIN},
-    make_segment_list_cont_(Seq, Mss, pushed, Cont, [Segment|Acc]).
-
-make_segment_list_cont_(Seq, Mss, Closed, [Data|Cont1], Acc) ->
-    make_segment_list_(Seq, Mss, Closed, Data, Cont1, Acc);
-make_segment_list_cont_(_Seq, _Mss, Closed, [], Acc) ->
-    {Closed, lists:reverse(Acc)}.
 
 transmit_arp(Dst,Src,Arp,State) ->
     Frame=#eth { src=Src, dst=Dst, type=arp, data=Arp},
@@ -1263,84 +1286,95 @@ send_data(Socket,State) ->
 	    Socket1
     end.
 
-transmit_data(Socket=#tcp_socket{ostream=Ostream},State) ->
-    #stream { closed=SentFin,bytes=Bytes,window=Window,segments=Segments } =
-	Ostream,
-    {SentFin1,Socket1,Segments1} =
-	transmit_stream(Socket,Segments,[],Bytes,Window,SentFin,State),
-    Ostream1 = Ostream#stream { closed=SentFin,segments = Segments1 },
+transmit_data(Socket=#tcp_socket{ostream=Ostream,istream=Istream},State) ->
+    #stream { closed=SentFin,bytes=Bytes,window=Window,blocks=Bs } = Ostream,
+    Mss = Istream#stream.mss,  %% segment size supported by remote
+    Options = if Socket#tcp_socket.tcp_opts band ?TCP_OPT_TIMESTAMP =/= 0 ->
+		      {10,[{timestamp,timestamp(),Socket#tcp_socket.tsecr}]};
+		 true ->
+		      {0,[]}
+	      end,
+    {SentFin1,Socket1,Bs1} = transmit_stream(Socket,Bs,[],Options,
+					     Mss,Bytes,Window,SentFin,State),
+    Ostream1 = Ostream#stream { closed=SentFin,blocks=Bs1 },
     {SentFin1,Socket1#tcp_socket { ostream = Ostream1 }}.
 
-%%
-%% here we may optimes and merge packets, mss will not change while
-%% we are established, but we may join bits if we want.
-%%
-transmit_stream(Socket,
-		Segments0=[S=#segment{seq=Seq,status=Stat,data=Data}|Segments],
-		Acc,Bytes,Window,SentFin,State) ->
+%% send unsent data segments
+transmit_stream(Socket,Bs0=[B=#block{seq=Seq,status=Stat,data=Data}|Bs],
+		Acc,Opts,Mss,Bytes,Window,SentFin,
+		State) ->
     if is_binary(Data) ->
-	    Bytes1 = Bytes + byte_size(Data),
-	    if Bytes1 =< Window ->
+	    {OptionsSize,TcpOptions} = Opts,
+	    SegSize = min(Mss-OptionsSize, byte_size(Data)),
+	    Bytes1 = Bytes + SegSize,
+	    if Bytes1 =< Window ->  %% ok to send
 		    if Stat =:= send ->
+			    <<Segment:SegSize/binary, Data1/binary>> = Data,
 			    Socket1=transmit_tcp(Socket,Seq,false,true,
-						 false,false,Data,State),
-			    Acc1 = [S#segment{status=waitack}|Acc],
-			    transmit_stream(Socket1,Segments,Acc1,Bytes1,Window,
+						 false,false,TcpOptions,
+						 Segment,State),
+			    B1 = B#block{status=waitack,data=Segment},
+			    Acc1 = [B1|Acc],
+			    Bs1 = if Data1 =:= <<>> -> Bs;
+				     true ->
+					  Seq1=?u32(Seq+SegSize),
+					  B0=#block{seq=Seq1,status=send,
+						    data=Data1},
+					  [B0|Bs]
+				  end,
+			    transmit_stream(Socket1,Bs1,Acc1,Opts,
+					    Mss,Bytes1,Window,
 					    SentFin,State);
 		       true ->
-			    transmit_stream(Socket,Segments,[S|Acc],
-					    Bytes1,Window,
+			    transmit_stream(Socket,Bs,[B|Acc],Opts,
+					    Mss,Bytes1,Window,
 					    SentFin,State)
 		    end;
 	       true ->
-		    {SentFin,Socket,lists:reverse(Acc)++Segments0}
+		    {SentFin,Socket,lists:reverse(Acc)++Bs0}
 	    end;
        is_reference(Data) ->
-	    transmit_stream(Socket,Segments,[S|Acc],Bytes,Window,SentFin,
+	    transmit_stream(Socket,Bs,[B|Acc],Opts,Mss,Bytes,Window,SentFin,
 			    State);
        Data =:= ?FIN ->
 	    if Stat =:= send ->
 		    Socket1 = transmit_fin(Socket,Seq,State),
-		    Acc1 = [S#segment{status=waitack}|Acc],
+		    Acc1 = [B#block{status=waitack}|Acc],
 		    %% handle event refs etc, must not send more data
-		    transmit_stream(Socket1,Segments,Acc1,Bytes,Window,true,
+		    transmit_stream(Socket1,Bs,Acc1,Opts,
+				    Mss,Bytes,Window,true,
 				    State);
 	       true ->
-		    transmit_stream(Socket,Segments,[S|Acc],Bytes,Window,true,
+		    transmit_stream(Socket,Bs,[B|Acc],Opts,
+				    Mss,Bytes,Window,true,
 				    State)
 	    end
     end;
-transmit_stream(Socket,[],Acc,_Bytes,_Window,SentFin,_State) ->
+transmit_stream(Socket,[],Acc,_Opts,_Mss,_Bytes,_Window,SentFin,_State) ->
     {SentFin,Socket,lists:reverse(Acc)}.
 
-
 transmit_syn(Socket,State) ->
-    transmit_tcp(Socket,true,false,false,false,<<>>,State).
+    TcpOptions = tcp_syn_options(Socket),
+    transmit_tcp(Socket,true,false,false,false,TcpOptions,<<>>,State).
 
 transmit_syn_ack(Socket,State) ->
-    transmit_tcp(Socket,true,true,false,false,<<>>,State).
+    TcpOptions = tcp_syn_options(Socket),
+    transmit_tcp(Socket,true,true,false,false,TcpOptions,<<>>,State).
 
 transmit_ack(Socket,State) ->
-    transmit_tcp(Socket,false,true,false,false,<<>>,State).
-
-transmit_tcp(Socket,Syn,Ack,Fin,Rst,Data,State) ->
-    SeqNo = (Socket#tcp_socket.ostream)#stream.seq,
-    transmit_tcp(Socket,SeqNo,Syn,Ack,Fin,Rst,Data,State).
+    transmit_tcp(Socket,false,true,false,false,[],<<>>,State).
 
 transmit_fin(Socket,SeqNo,State) ->
-    transmit_tcp(Socket,SeqNo,false,false,true,false,<<>>,State).
+    transmit_tcp(Socket,SeqNo,false,false,true,false,[],<<>>,State).
 
-transmit_tcp(Socket=#tcp_socket{ostream=Ostream, istream=Istream},SeqNo,
-	     Syn,Ack,Fin,Rst,Data,State) ->
-    Window = Istream#stream.window - Istream#stream.bytes, %% input remain
-    {Wsize,Wscale} = window_to_wss(Window),
-    TcpOptions = [],
-    TcpOptions1 = if Wscale > 0 -> [{window_size_shift,Wscale}|TcpOptions];
-		     true -> TcpOptions
-		  end,
-    TcpOptions2 = if Syn -> [{mss,Ostream#stream.mss}|TcpOptions1];
-		     true -> TcpOptions1
-		  end,
+transmit_tcp(Socket,Syn,Ack,Fin,Rst,TcpOptions,Data,State) ->
+    SeqNo = (Socket#tcp_socket.ostream)#stream.seq,
+    transmit_tcp(Socket,SeqNo,Syn,Ack,Fin,Rst,TcpOptions,Data,State).
+
+transmit_tcp(Socket=#tcp_socket{istream=Istream,ostream=Ostream},SeqNo,
+	     Syn,Ack,Fin,Rst,TcpOptions,Data,State) ->
+    Remain = Istream#stream.window - Istream#stream.bytes, %% window remain
+    SegWnd = Remain bsr Ostream#stream.wscale, %% scale is stored in output!
     Tcp = #tcp { src_port = Socket#tcp_socket.src_port,
 		 dst_port = Socket#tcp_socket.dst_port,
 		 seq_no   = SeqNo,
@@ -1349,10 +1383,10 @@ transmit_tcp(Socket=#tcp_socket{ostream=Ostream, istream=Istream},SeqNo,
 		 reserved=0,
 		 urg=false,ack=Ack,psh=(Data =/= <<>>),
 		 rst=Rst,syn=Syn,fin=Fin,
-		 window=Wsize,
+		 window=SegWnd,
 		 csum=correct,
 		 urg_pointer=0,
-		 options = TcpOptions2,
+		 options = TcpOptions,
 		 data = Data},
     log_tcp(Socket, Tcp, ">"),
     transmit_ip(Socket, tcp, Tcp, State).
@@ -1374,18 +1408,146 @@ random_32() ->
     <<X:32>> = crypto:rand_bytes(4),
     X.
 
-%% calculte mss given protocol and interface mtu
-calc_mss(IP,State) when tuple_size(IP) =:= 4 ->
-    if State#state.mtu > ?TCP_IPV4_HEADER_MIN_LEN ->
-	    State#state.mtu-?TCP_IPV4_HEADER_MIN_LEN;
-       true -> 1500 - ?TCP_IPV4_HEADER_MIN_LEN
+default_mss(IP,State) when tuple_size(IP) =:= 4 ->
+    if State#state.tiny_mss -> ?TCP_TINY_MSS;
+       true -> ?TCP_DEFAULT_IPV4_MSS
     end;
-calc_mss(IP,State) when tuple_size(IP) =:= 8 ->
-    if State#state.mtu > ?TCP_IPV6_HEADER_MIN_LEN ->
-	    State#state.mtu-?TCP_IPV6_HEADER_MIN_LEN;
-       true -> 1500 - ?TCP_IPV6_HEADER_MIN_LEN
+default_mss(IP,State) when tuple_size(IP) =:= 8 ->
+    if State#state.tiny_mss -> ?TCP_TINY_MSS;
+       true -> ?TCP_DEFAULT_IPV6_MSS
     end.
 
+%% calculte mss given protocol and interface mtu
+calc_mss(IP,State) when tuple_size(IP) =:= 4 ->
+    if State#state.tiny_mss -> ?TCP_TINY_MSS;
+       State#state.mtu > ?TCP_IPV4_HEADER_MIN_LEN ->
+	    State#state.mtu-?TCP_IPV4_HEADER_MIN_LEN;
+       true -> ?TCP_DEFAULT_IPV4_MSS
+    end;
+calc_mss(IP,State) when tuple_size(IP) =:= 8 ->
+    if State#state.tiny_mss -> ?TCP_TINY_MSS;
+       State#state.mtu > ?TCP_IPV6_HEADER_MIN_LEN ->
+	    State#state.mtu-?TCP_IPV6_HEADER_MIN_LEN;
+       true -> ?TCP_DEFAULT_IPV6_MSS
+    end.
+
+%% TCP options sent in SYN/SYN+ACK packet
+tcp_syn_options(Socket) ->
+    %% push flags in the reversed order, they are build reversed
+    tcp_syn_opts_([?TCP_OPT_TIMESTAMP,?TCP_OPT_WSCALE,
+		      ?TCP_OPT_SACK,?TCP_OPT_MSS],
+		     Socket#tcp_socket.tcp_opts,
+		     Socket, []).
+
+tcp_syn_opts_(_Fs, 16#0000, _Socket, Acc) -> %% no more flags allowed
+    Acc;
+tcp_syn_opts_([F|Fs], Flags, Socket, Acc) when F band Flags =/= 0 ->
+    Flags1 = Flags band (bnot F),
+    case F of
+	?TCP_OPT_MSS ->
+	    tcp_syn_opts_(Fs, Flags1, Socket,
+			  [{mss,(Socket#tcp_socket.ostream)#stream.mss}|Acc]);
+	?TCP_OPT_WSCALE ->
+	    tcp_syn_opts_(Fs, Flags1, Socket,
+			 [{window_size_shift,
+			   (Socket#tcp_socket.ostream)#stream.wscale}|Acc]);
+	?TCP_OPT_TIMESTAMP ->
+	    tcp_syn_opts_(Fs, Flags1, Socket,
+			  [{timestamp,timestamp(),0}|Acc]);
+	?TCP_OPT_SACK ->
+	    tcp_syn_opts_(Fs, Flags1, Socket, [sack_ok|Acc]);
+	_ -> %% ignore unknown options
+	    tcp_syn_opts_(Fs, Flags1, Socket, Acc)
+    end;
+tcp_syn_opts_([_|Fs], Flags, Socket, Acc) -> %% flag not allowed
+    tcp_syn_opts_(Fs, Flags, Socket, Acc);
+tcp_syn_opts_([], _Flags, _Socket, Acc) -> Acc.
+
+%% Other side is sending options Flags dictate we.
+accept_syn_options(Fs, Socket, State) ->
+    accept_syn_opts_(Fs, Socket#tcp_socket.tcp_opts, 0, Socket, State).
+
+accept_syn_opts_([F|Fs], Flags, OFlags, Socket, State) ->
+    case F of
+	{mss,Mss} ->
+	    Flag = ?TCP_OPT_MSS band Flags,
+	    {IMss,OMss} =
+		if Flag =:= 0, State#state.tiny_mss ->
+			{?TCP_TINY_MSS,?TCP_TINY_MSS};
+		   Flag =:= 0 ->
+			{?TCP_DEFAULT_IPV4_MSS,?TCP_DEFAULT_IPV4_MSS};
+		   State#state.tiny_mss ->
+			{?TCP_TINY_MSS,calc_mss(Socket#tcp_socket.dst, State)};
+		   true ->
+			{Mss,calc_mss(Socket#tcp_socket.dst, State)}
+		end,
+	    #tcp_socket { istream=Istream, ostream=Ostream } = Socket,
+	    Istream1 = Istream#stream { mss = IMss },
+	    Ostream1 = Ostream#stream { mss = OMss },
+	    Socket1 = Socket#tcp_socket { istream=Istream1, ostream=Ostream1 },
+	    io:format("option mss [~w] = ~w\n", [ Flag =/= 0, {IMss,OMss}]),
+	    accept_syn_opts_(Fs, Flags, OFlags bor Flag, Socket1, State);
+
+	{window_size_shift, Wss} ->
+	    Flag = ?TCP_OPT_WSCALE band Flags,
+	    {IWss,OWss} = if Flag =:= 0 -> 
+				  {0, 0}; 
+			     true ->
+				  {Wss,State#state.wscale}
+			  end,
+	    #tcp_socket { istream=Istream, ostream=Ostream } = Socket,
+	    Istream1 = Istream#stream { wscale = IWss },
+	    Ostream1 = Ostream#stream { wscale = OWss },
+	    Socket1 = Socket#tcp_socket { istream=Istream1, ostream=Ostream1 },
+	    io:format("option wss [~w] = ~w\n", [ Flag =/= 0, {IWss,OWss}]),
+	    accept_syn_opts_(Fs, Flags, OFlags bor Flag, Socket1, State);
+
+	{timestamp, Ts, _TsReply} ->
+	    Flag = ?TCP_OPT_TIMESTAMP band Flags,
+	    Ts1 = if Flag =:= 0 -> 0; true -> Ts end,
+	    Socket1 = Socket#tcp_socket { tsecr = Ts1 },
+	    io:format("option timestamp [~w] = ~w\n", [ Flag =/= 0,
+							{Ts,_TsReply}]),
+	    accept_syn_opts_(Fs, Flags, OFlags bor Flag, Socket1, State);
+
+	sack_ok ->
+	    Flag = ?TCP_OPT_SACK band Flags,
+	    io:format("option sack [~w]\n", [ Flag =/= 0 ]),
+	    accept_syn_opts_(Fs, Flags, OFlags bor Flag, Socket, State);
+
+	nop ->
+	    accept_syn_opts_(Fs, Flags, OFlags, Socket, State);
+	_ ->
+	    ?debug("accept_syn_opts: ignore unknown option ~p\n", [F]),
+	    accept_syn_opts_(Fs, Flags, OFlags, Socket, State)
+    end;
+accept_syn_opts_([],_Flags,OFlags,Socket,_State) ->
+    Socket#tcp_socket { tcp_opts = OFlags }.
+
+%% handle timestamp on input store last value, update rtt etc
+handle_timestamp(Socket, Tcp) ->
+    if Socket#tcp_socket.tcp_opts band ?TCP_OPT_TIMESTAMP =:= 0 ->
+	    Socket;
+       true ->
+	    case lists:keyfind(timestamp, 1, Tcp#tcp.options) of
+		false -> Socket;
+		{_, TsVal, TSecr} ->
+		    Socket1 = Socket#tcp_socket { tsecr = TsVal },
+		    if Tcp#tcp.ack -> %% TSecr value only when acknowledge
+			    Left = left_sequence_no(Socket1#tcp_socket.ostream),
+			    %% TSecr used when acking new data
+			    case ?seq_lt(Left, Tcp#tcp.ack_no) of
+				true ->
+				    rto_sample(TSecr, Socket1);
+				false ->
+				    Socket1
+			    end;
+		       true ->
+			    Socket1
+		    end
+	    end
+    end.
+    
 %% update rto according to rfc 6298
 -define(K, 4).
 -define(alpha, 0.125).  %% 1/8
@@ -1401,45 +1563,33 @@ rto_backoff(Socket=#tcp_socket { rto = RTO }) when RTO < ?MAX_RTO ->
     Socket#tcp_socket { rto = RTO*2 };
 rto_backoff(Socket) -> Socket.
 
+rto_sample(TSecr, Socket) when is_integer(TSecr), TSecr > 0 ->
+    R = ?u32(timestamp() - TSecr) / 1000,  %% convert to seconds
+    rto_update(R, Socket).
+
 %% update rto with roundtrip sample R (in seconds)
-rto_update(Socket, R) ->
+rto_update(R,Socket) when is_float(R) ->
     case Socket of
 	#tcp_socket { srtt = undefined } ->  %% first measurement
 	    SRTT = R,
 	    RTTVAR = R / 2,
-	    Socket#tcp_socket { srtt = SRTT,
-				rttvar = RTTVAR,
-				rto = SRTT + max(?GRANULARITY_RTO, ?K*RTTVAR) };
+	    RTO = SRTT + max(?GRANULARITY_RTO, ?K*RTTVAR),
+	    io:format("first RTO=~w R=~w\n", [RTO, R]),
+	    Socket#tcp_socket { srtt=SRTT, rttvar=RTTVAR, rto=RTO };
 	#tcp_socket { srtt = SRTT0, rttvar = RTTVAR0 } ->
 	    RTTVAR = (1-?beta)*RTTVAR0 + ?beta*abs(SRTT0 - R),
 	    SRTT = (1-?alpha)*SRTT0 + ?alpha*R,
-	    Socket#tcp_socket {  srtt = SRTT,
-				 rttvar = RTTVAR,
-				 rto = SRTT + max(?GRANULARITY_RTO, ?K*RTTVAR) }
+	    RTO = SRTT + max(?GRANULARITY_RTO, ?K*RTTVAR),
+	    io:format("new RTO=~w, R=~w\n", [RTO,R]),
+	    Socket#tcp_socket {  srtt=SRTT, rttvar=RTTVAR, rto=RTO }
     end.
 
 %% generate a timestamp for the packet (using ms)
 timestamp() ->
     now_to_ms(os:timestamp()).
 
-now_to_ms({_,S,U}) ->
-    (S*1000 + (U div 1000)) band 16#ffffffff.
-
-%% calculate size and scale on transmission window
-wss_to_window({Window,Scale}) ->
-    wss_to_window(Window, Scale).
-
-wss_to_window(Wsize,WScale) ->
-    Wsize bsl WScale.
-
-window_to_wss(Window) ->
-    window_to_wss(Window, 0).
-
-%% fixme: make sure Scale <= 14!
-window_to_wss(Window, Scale) ->
-    if Window > 16#ffff -> window_to_wss(Window bsr 1, Scale+1);
-       true  -> {Window,Scale}
-    end.
+now_to_ms({M,S,U}) ->
+    ?u32((M*1000000+S)*1000 + (U div 1000)).
 
 %% build for
 insert_cache(_, {0,0,0,0,0,0}, State) -> State;
@@ -1476,7 +1626,7 @@ log_tcp(Socket, Tcp, "<") when is_record(Socket,lst_socket) ->
 
 
 log_tcp(TcpState,Src,SrcPort,Dst,DstPort,Tcp,Dir) ->
-    io:format("tcp[~s]: ~s:~w ~s ~s:~w: ~w ~s ack=~w : ~s\n",
+    io:format("tcp[~s]: ~s:~w ~s ~s:~w: ~w ~s ack=~w opts=~w: ~s\n",
 	      [TcpState,
 	       format_ip_addr(Src), SrcPort,
 	       Dir,
@@ -1484,6 +1634,7 @@ log_tcp(TcpState,Src,SrcPort,Dst,DstPort,Tcp,Dir) ->
 	       Tcp#tcp.seq_no,
 	       format_tcp_flags(Tcp),
 	       Tcp#tcp.ack_no,
+	       Tcp#tcp.options,
 	       format_tcp_data(Tcp#tcp.data, 20)]).
 
 format_ip_addr({A,B,C,D}) ->
