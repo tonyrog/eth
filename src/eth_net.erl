@@ -43,14 +43,8 @@
 -define(IPV4_MIN_SIZE, 576).
 -define(IPV6_MIN_SIZE, 576).
 -define(TCP_DEFAULT_IPV4_MSS, (?IPV4_MIN_SIZE - ?TCP_IPV4_HEADER_MIN_LEN)).
--define(TCP_DEFAULT_IPV6_MSS, (?IPV6_MIN_SIZE - ?TCP_IPV4_HEADER_MIN_LEN)).
+-define(TCP_DEFAULT_IPV6_MSS, (?IPV6_MIN_SIZE - ?TCP_IPV6_HEADER_MIN_LEN)).
 
-%% linux define TCP_MIN_MSS as 88 (strange why?) a lot of stange ideas
-%% and magic on the internet :-)
--define(TCP_TINY_MSS, 88). %% MSS used for testing. (10=timestamp,4=data)
--define(TCP_TINY_MSS, 14). %% MSS used for testing. (10=timestamp,4=data)
-%% -define(TCP_TINY_MSS, 14). %% MSS used for testing. (10=timestamp,4=data)
-%% mac os x set minmss with sysctl = default 216
 
 -type socket_key() ::
 	{ tcp, ip_address(), port_no() } | %% listen "socket"
@@ -95,7 +89,7 @@
 -record(stream,
 	{
 	  window=65535 :: non_neg_integer(), %% current announced window size
-	  wscale = 0 :: 0..14,   %% wscale if supported
+	  wss = 0 :: 0..14,      %% window scale shift, if supported
 	  mss :: uint16(),       %% maximum segment size used
 	  bytes = 0 :: uint32(), %% number bytes sent / received in window
 	  seq = 0 :: uint32(),   %% current seqeuence number
@@ -113,12 +107,13 @@
 	  src_port :: port_no(),
 	  dst_port :: port_no(),
 	  owner    :: pid(),
+	  options  :: [{atom(),term()}],  %% listen options
 	  %% add syn queue .
 	  aqueue = [] :: [{reference(),pid()}]   %% accept queue
 	}).
 
 %% http://en.wikipedia.org/wiki/Transmission_Control_Protocol
-%% 
+%%
 %% flags for tcp option support (roughly the option number as a bit)
 -define(TCP_OPT_NONE,         16#0000).
 
@@ -128,7 +123,7 @@
 %% SACK - RFC 2018 - Kind = 4 (+ 5)
 -define(TCP_OPT_SACK,         16#0010).  %% (1 bsl 4), Kind = 4
 %% RFC 1323 - TCP Extensions for High Performance
--define(TCP_OPT_WSCALE,       16#0008).  %% (1 bsl 3), Kind = 3
+-define(TCP_OPT_WSS,          16#0008).  %% (1 bsl 3), Kind = 3
 -define(TCP_OPT_TIMESTAMP,    16#0100).  %% (1 bsl 8), Kind = 8
 
 -type tcp_syn_options() :: uint16().
@@ -177,7 +172,7 @@
 -type socket() :: #tcp_socket{} | #udp_socket{} | #lst_socket{}.
 
 -define(DEFAULT_TCP_OPTIONS,
-	?TCP_OPT_MSS bor ?TCP_OPT_TIMESTAMP).	
+	?TCP_OPT_MSS bor ?TCP_OPT_TIMESTAMP).
 
 -record(state,
 	{
@@ -187,8 +182,9 @@
 	  mac :: ethernet_address(),       %% the mac address on interface
 	  %% options offered & allowed in syn packets
 	  tcp_opts = ?DEFAULT_TCP_OPTIONS :: tcp_syn_options(),
-	  wscale  = 0,                 %% window scaling when supported
-	  tiny_mss = true,             %% debug test very small segments
+	  wssdflt = 0,   %% window scaling shift (0..14)
+	  mssdflt   = ?TCP_DEFAULT_IPV4_MSS,
+	  v6mssdflt = ?TCP_DEFAULT_IPV6_MSS,
 	  ipmac :: dict:dict(ip_address(),ethernet_address()),
 	  macs :: sets:set(ethernet_address()),
 	  cache :: dict:dict(ip_address(),ethernet_address()),
@@ -226,6 +222,12 @@ udp_send(Net, UdpRef, DestIP, DestPort, Data) ->
     gen_server:call(Net, {udp_send, UdpRef, DestIP, DestPort, Data}).
 %%
 %% tcp interface
+%%
+%% current tcp options include:
+%%  {mss,Mss}   -- announced mss value, limited by interface however.
+%%  {send_mss,Mss}  -- forced send mss, used mainliy for testing,
+%%                     never bigger than remotliy announced value
+%%  {wss,Wss}       -- window scaling factor shift factor override
 %%
 
 tcp_listen(Net, SrcIP, SrcPort, Options) ->
@@ -363,7 +365,7 @@ handle_call({udp_send,Ref,DstIP,DstPort,Data}, _From, State) ->
     {Result,State1} = transmit_udp(Ref,DstIP,DstPort,Data, State),
     {reply,Result,State1};
 
-handle_call({tcp_listen,Owner,SrcIP,SrcPort,_Options}, _From, State) ->
+handle_call({tcp_listen,Owner,SrcIP,SrcPort,Options}, _From, State) ->
     Key = {tcp,SrcIP,SrcPort},
     case dict:find(Key,State#state.sockets) of
 	error ->
@@ -376,7 +378,9 @@ handle_call({tcp_listen,Owner,SrcIP,SrcPort,_Options}, _From, State) ->
 					   mac = SrcMac,
 					   src = SrcIP,
 					   src_port = SrcPort,
-					   owner = Owner },
+					   owner = Owner,
+					   options = Options
+					 },
 		    State1 = add_socket(Socket, State),
 
 		    Sockets = dict:store(Key, Socket, State#state.sockets),
@@ -406,7 +410,7 @@ handle_call({tcp_accept,LRef,Acceptor}, _From, State) ->
 	    {reply, {error, einval},  State}
     end;
 
-handle_call({tcp_connect,Owner,SrcIP,SrcPort,DstIP,DstPort,_Options},
+handle_call({tcp_connect,Owner,SrcIP,SrcPort,DstIP,DstPort,Options},
 	    _From, State) ->
     %% fixme: SrcPort=0 means dynamic port
     Key = {tcp,SrcIP,SrcPort,DstIP,DstPort},
@@ -417,10 +421,16 @@ handle_call({tcp_connect,Owner,SrcIP,SrcPort,DstIP,DstPort,_Options},
 		    {reply, {error, einval}, State};
 		{ok,SrcMac} ->
 		    Ref = erlang:monitor(process, Owner),
-		    OMss = default_mss(SrcIP, State),
-		    IMss = calc_mss(SrcIP, State),
-		    Ostream = #stream { mss=OMss, seq=random_32() },
-		    Istream = #stream { mss=IMss, wscale=State#state.wscale },
+		    OMss = proplists:get_value(mss, Options,
+					      calc_mss(SrcIP, State)),
+		    OWss = proplists:get_value(wss,Options,State#state.wssdflt),
+		    IMss = case proplists:get_value(send_mss,Options) of
+			       undefined -> default_mss(SrcIP,State);
+			       SendMss -> {force,SendMss}
+			   end,
+		    Ostream = #stream { mss=OMss, wss=OWss, seq=random_32() },
+		    Istream = #stream { mss=IMss },
+
 		    Socket = #tcp_socket { ref=Ref, key=Key,
 					   tcp_state = ?TCP_SYN_SENT,
 					   mac = SrcMac,
@@ -821,10 +831,16 @@ handle_accept(LSocket,Tcp,IP,Eth,State) ->
 		[{Ref,Pid}|AQueue] ->
 		    Key = {tcp,IP#ipv4.dst,Tcp#tcp.dst_port,
 			   IP#ipv4.src,Tcp#tcp.src_port},
-		    %% unless mss option is used this is what we use for sending
-		    IMss = default_mss(IP#ipv4.dst,State),
-		    OMss = calc_mss(IP#ipv4.dst,State), %% send this if mss
-		    Ostream = #stream { window=Wsize,mss=OMss,seq=random_32() },
+		    Options = LSocket#lst_socket.options,
+		    OMss = proplists:get_value(mss,Options,
+					      calc_mss(IP#ipv4.dst, State)),
+		    OWss = proplists:get_value(wss,Options,State#state.wssdflt),
+		    IMss = case proplists:get_value(send_mss,Options) of
+			       undefined -> default_mss(IP#ipv4.dst,State);
+			       SendMss -> {force,SendMss}
+			   end,
+		    Ostream = #stream { window=Wsize,mss=OMss,wss=OWss,
+					seq=random_32() },
 		    Istream = #stream { mss=IMss,seq=?seq_next(Tcp#tcp.seq_no)},
 		    Socket = #tcp_socket { ref=Ref, key=Key, mac=Eth#eth.dst,
 					   src = IP#ipv4.dst,
@@ -865,7 +881,7 @@ tcp_fsm(?TCP_SYN_RCVD,Socket=#tcp_socket{istream=Istream,ostream=Ostream},
 	       window=Wsize,options=_TcpOptions,data= <<>> } when
 	      AckNo =:= ?seq_next(Ostream#stream.seq) ->
 	    tcp_report_connected(Socket),
-	    Window = Wsize bsl Istream#stream.wscale,
+	    Window = Wsize bsl Istream#stream.wss,
 	    Ostream1 = Ostream#stream {	seq=AckNo, window=Window },
 	    Istream1 = Istream#stream { seq=Seq },
 	    Socket#tcp_socket { tcp_state = ?TCP_ESTABLISHED,
@@ -911,10 +927,9 @@ tcp_fsm(?TCP_ESTABLISHED, Socket=#tcp_socket{ istream=Istream,ostream=Ostream },
 					 ?TCP_CLOSE_WAIT;
 				  true -> ?TCP_ESTABLISHED
 			       end,
-		    Window = Wsize bsl Istream#stream.wscale,
+		    Window = Wsize bsl Istream#stream.wss,
 		    ISeq = if Fin -> ?u32(Seq+Len+1); true -> ?u32(Seq+Len) end,
-		    Istream1 = Istream#stream { closed=Fin,
-						seq=ISeq,blocks=[] },
+		    Istream1 = Istream#stream { closed=Fin,seq=ISeq,blocks=[] },
 		    Ostream1 = Ostream0#stream { window=Window },
 		    Socket1 = Socket#tcp_socket { tcp_state=TcpState,
 						  ostream=Ostream1,
@@ -1374,7 +1389,7 @@ transmit_tcp(Socket,Syn,Ack,Fin,Rst,TcpOptions,Data,State) ->
 transmit_tcp(Socket=#tcp_socket{istream=Istream,ostream=Ostream},SeqNo,
 	     Syn,Ack,Fin,Rst,TcpOptions,Data,State) ->
     Remain = Istream#stream.window - Istream#stream.bytes, %% window remain
-    SegWnd = Remain bsr Ostream#stream.wscale, %% scale is stored in output!
+    SegWnd = Remain bsr Ostream#stream.wss,
     Tcp = #tcp { src_port = Socket#tcp_socket.src_port,
 		 dst_port = Socket#tcp_socket.dst_port,
 		 seq_no   = SeqNo,
@@ -1408,33 +1423,27 @@ random_32() ->
     <<X:32>> = crypto:rand_bytes(4),
     X.
 
-default_mss(IP,State) when tuple_size(IP) =:= 4 ->
-    if State#state.tiny_mss -> ?TCP_TINY_MSS;
-       true -> ?TCP_DEFAULT_IPV4_MSS
-    end;
-default_mss(IP,State) when tuple_size(IP) =:= 8 ->
-    if State#state.tiny_mss -> ?TCP_TINY_MSS;
-       true -> ?TCP_DEFAULT_IPV6_MSS
-    end.
+default_mss(IP,State) when tuple_size(IP) =:= 4 -> State#state.mssdflt;
+default_mss(IP,State) when tuple_size(IP) =:= 8 -> State#state.v6mssdflt.
 
 %% calculte mss given protocol and interface mtu
 calc_mss(IP,State) when tuple_size(IP) =:= 4 ->
-    if State#state.tiny_mss -> ?TCP_TINY_MSS;
-       State#state.mtu > ?TCP_IPV4_HEADER_MIN_LEN ->
+    if State#state.mtu > ?TCP_IPV4_HEADER_MIN_LEN ->
 	    State#state.mtu-?TCP_IPV4_HEADER_MIN_LEN;
-       true -> ?TCP_DEFAULT_IPV4_MSS
+       true ->
+	    State#state.mssdflt
     end;
 calc_mss(IP,State) when tuple_size(IP) =:= 8 ->
-    if State#state.tiny_mss -> ?TCP_TINY_MSS;
-       State#state.mtu > ?TCP_IPV6_HEADER_MIN_LEN ->
+    if State#state.mtu > ?TCP_IPV6_HEADER_MIN_LEN ->
 	    State#state.mtu-?TCP_IPV6_HEADER_MIN_LEN;
-       true -> ?TCP_DEFAULT_IPV6_MSS
+       true ->
+	    State#state.v6mssdflt
     end.
 
 %% TCP options sent in SYN/SYN+ACK packet
 tcp_syn_options(Socket) ->
     %% push flags in the reversed order, they are build reversed
-    tcp_syn_opts_([?TCP_OPT_TIMESTAMP,?TCP_OPT_WSCALE,
+    tcp_syn_opts_([?TCP_OPT_TIMESTAMP,?TCP_OPT_WSS,
 		      ?TCP_OPT_SACK,?TCP_OPT_MSS],
 		     Socket#tcp_socket.tcp_opts,
 		     Socket, []).
@@ -1447,10 +1456,10 @@ tcp_syn_opts_([F|Fs], Flags, Socket, Acc) when F band Flags =/= 0 ->
 	?TCP_OPT_MSS ->
 	    tcp_syn_opts_(Fs, Flags1, Socket,
 			  [{mss,(Socket#tcp_socket.ostream)#stream.mss}|Acc]);
-	?TCP_OPT_WSCALE ->
+	?TCP_OPT_WSS ->
 	    tcp_syn_opts_(Fs, Flags1, Socket,
 			 [{window_size_shift,
-			   (Socket#tcp_socket.ostream)#stream.wscale}|Acc]);
+			   (Socket#tcp_socket.ostream)#stream.wss}|Acc]);
 	?TCP_OPT_TIMESTAMP ->
 	    tcp_syn_opts_(Fs, Flags1, Socket,
 			  [{timestamp,timestamp(),0}|Acc]);
@@ -1471,17 +1480,19 @@ accept_syn_opts_([F|Fs], Flags, OFlags, Socket, State) ->
     case F of
 	{mss,Mss} ->
 	    Flag = ?TCP_OPT_MSS band Flags,
-	    {IMss,OMss} =
-		if Flag =:= 0, State#state.tiny_mss ->
-			{?TCP_TINY_MSS,?TCP_TINY_MSS};
-		   Flag =:= 0 ->
-			{?TCP_DEFAULT_IPV4_MSS,?TCP_DEFAULT_IPV4_MSS};
-		   State#state.tiny_mss ->
-			{?TCP_TINY_MSS,calc_mss(Socket#tcp_socket.dst, State)};
-		   true ->
-			{Mss,calc_mss(Socket#tcp_socket.dst, State)}
-		end,
 	    #tcp_socket { istream=Istream, ostream=Ostream } = Socket,
+	    {IMss,OMss} =
+		if Flag =:= 0 ->
+			{Istream#stream.mss,Ostream#stream.mss};
+		   true ->
+			CMss = calc_mss(Socket#tcp_socket.dst,State),
+			IMss0 = case Istream#stream.mss of
+				    {force,FMss} -> min(CMss,FMss);
+				    _Default -> min(CMss,Mss)
+				end,
+			OMss0 = min(Ostream#stream.mss, CMss),
+			{IMss0,OMss0}
+		end,
 	    Istream1 = Istream#stream { mss = IMss },
 	    Ostream1 = Ostream#stream { mss = OMss },
 	    Socket1 = Socket#tcp_socket { istream=Istream1, ostream=Ostream1 },
@@ -1489,15 +1500,16 @@ accept_syn_opts_([F|Fs], Flags, OFlags, Socket, State) ->
 	    accept_syn_opts_(Fs, Flags, OFlags bor Flag, Socket1, State);
 
 	{window_size_shift, Wss} ->
-	    Flag = ?TCP_OPT_WSCALE band Flags,
-	    {IWss,OWss} = if Flag =:= 0 -> 
-				  {0, 0}; 
-			     true ->
-				  {Wss,State#state.wscale}
-			  end,
+	    Flag = ?TCP_OPT_WSS band Flags,
 	    #tcp_socket { istream=Istream, ostream=Ostream } = Socket,
-	    Istream1 = Istream#stream { wscale = IWss },
-	    Ostream1 = Ostream#stream { wscale = OWss },
+	    {IWss,OWss} = if Flag =:= 0 -> {0, 0};
+			     true ->
+				  OWss0 = Ostream#stream.wss,
+				  OWss1 = max(State#state.wssdflt,OWss0),
+				  {min(14,Wss),min(14,OWss1)}
+			  end,
+	    Istream1 = Istream#stream { wss = IWss },
+	    Ostream1 = Ostream#stream { wss = OWss },
 	    Socket1 = Socket#tcp_socket { istream=Istream1, ostream=Ostream1 },
 	    io:format("option wss [~w] = ~w\n", [ Flag =/= 0, {IWss,OWss}]),
 	    accept_syn_opts_(Fs, Flags, OFlags bor Flag, Socket1, State);
@@ -1522,7 +1534,14 @@ accept_syn_opts_([F|Fs], Flags, OFlags, Socket, State) ->
 	    accept_syn_opts_(Fs, Flags, OFlags, Socket, State)
     end;
 accept_syn_opts_([],_Flags,OFlags,Socket,_State) ->
-    Socket#tcp_socket { tcp_opts = OFlags }.
+    %% what happens if we get a retransmit on SYN with new options?
+    #tcp_socket { istream=Istream } = Socket,
+    %% adjust forced values
+    Istream1 = case Istream#stream.mss of
+		   {force,FMss} -> Istream#stream{mss=FMss};
+		   _ -> Istream
+	       end,
+    Socket#tcp_socket { tcp_opts = OFlags, istream=Istream1 }.
 
 %% handle timestamp on input store last value, update rtt etc
 handle_timestamp(Socket, Tcp) ->
@@ -1547,7 +1566,7 @@ handle_timestamp(Socket, Tcp) ->
 		    end
 	    end
     end.
-    
+
 %% update rto according to rfc 6298
 -define(K, 4).
 -define(alpha, 0.125).  %% 1/8
@@ -1624,7 +1643,7 @@ log_tcp(Socket, Tcp, "<") when is_record(Socket,lst_socket) ->
 	    Socket#lst_socket.src, Tcp#tcp.dst_port,
 	    Socket#lst_socket.dst, Tcp#tcp.src_port, Tcp, "<").
 
-
+%% fixme options (timestamps) in a nice way
 log_tcp(TcpState,Src,SrcPort,Dst,DstPort,Tcp,Dir) ->
     io:format("tcp[~s]: ~s:~w ~s ~s:~w: ~w ~s ack=~w opts=~w: ~s\n",
 	      [TcpState,
@@ -1635,17 +1654,20 @@ log_tcp(TcpState,Src,SrcPort,Dst,DstPort,Tcp,Dir) ->
 	       format_tcp_flags(Tcp),
 	       Tcp#tcp.ack_no,
 	       Tcp#tcp.options,
-	       format_tcp_data(Tcp#tcp.data, 20)]).
+	       format_tcp_data(Tcp#tcp.data, 64)]).
 
 format_ip_addr({A,B,C,D}) ->
     io_lib:format("~w.~w.~w.~w", [A,B,C,D]);
 format_ip_addr(undefined) ->
     "".
 
+format_tcp_data(<<>>,_Max) -> "";
 format_tcp_data(Binary,Max) when is_binary(Binary) ->
-    case list_to_binary(io_lib:format("~p", [Binary])) of
-	<<Bin:Max/binary, _/binary>> -> Bin;
-	Bin -> Bin
+    case list_to_binary(io_lib:format("~w[~s", [byte_size(Binary),Binary])) of
+	<<Bin:Max/binary, _/binary>> ->
+	    binary_to_list(Bin) ++ "..]";
+	Bin ->
+	    binary_to_list(Bin) ++ "]"
     end.
 
 format_tcp_flags(Tcp) ->

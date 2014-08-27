@@ -15,6 +15,14 @@
 
 -compile(export_all).
 
+%% linux define TCP_MIN_MSS as 88 (strange why?) a lot of stange ideas
+%% and magic on the internet :-)
+%% -define(TCP_TINY_MSS, 88). %% MSS used for testing. (10=timestamp,4=data)
+%% Mac os x has minmss = 270, mssdflt = 512
+%% use sysctl -a | grep mss to find out
+
+-define(TEST_MSS, 64). %% 270 works
+
 %% run as root!
 test1() ->
     setup(),
@@ -72,7 +80,8 @@ init() ->
     Net.
 
 tcp_accept(Net) ->
-    {ok,L} = eth_net:tcp_listen(Net, {192,168,10,10}, 6668, []),
+    {ok,L} = eth_net:tcp_listen(Net, {192,168,10,10}, 6668, 
+				[{mss,?TEST_MSS},{send_mss,?TEST_MSS}]),
     {ok,S} = eth_net:tcp_accept(Net, L),
     io:format("enter eth_tcp_server\n"),
     eth_tcp_server(Net, undefined, S).
@@ -80,9 +89,12 @@ tcp_accept(Net) ->
 tcp_connect(Net) ->
     eth_net:query_mac(Net, {192,168,10,1}), %% force caching
     timer:sleep(100),
+    random:seed(erlang:now()),
+    SrcPort = 57000 + random:uniform(1000),  %% fixme!
     {ok,S} = eth_net:tcp_connect(Net,
-				 {192,168,10,10},57563,
-				 {192,168,10,1},6668,[]),
+				 {192,168,10,10},SrcPort,
+				 {192,168,10,1},6668,[{mss,?TEST_MSS},
+						      {send_mss,?TEST_MSS}]),
     io:format("enter eth_tcp_server\n"),
     eth_tcp_server(Net, undefined, S).
 
@@ -97,7 +109,7 @@ eth_tcp_server(Net, Remote, S) ->
 	    case binary:split(Message, <<"\r\n">>, [global,trim]) of
 		[<<"ping">>] ->
 		    eth_net:tcp_send(Net, S, <<"pong\r\n">>),
-		    ?MODULE:eth_tcpl_server(Net, Remote, S);
+		    ?MODULE:eth_tcp_server(Net, Remote, S);
 		[<<"stop">>] ->
 		    eth_net:tcp_send(Net, S, <<"ok\r\n">>),
 		    eth_net:tcp_shutdown(Net, S),
@@ -119,13 +131,14 @@ eth_tcp_server(Net, Remote, S) ->
     end.
 
 gen_tcp_client(S) ->
-    gen_tcp:send(S, <<"ping\r\n">>),
+    gen_tcp:send(S, <<"ping\r\n">>), %% pong
     receive
 	{tcp,S,Data} -> io:format("client got: ~s\n", [Data])
     after 1000 ->
 	    io:format("client got nothing\n", [])
     end,
-    gen_tcp:send(S, <<"foo\r\n">>),
+    D500 = <<"01234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789">>,
+    gen_tcp:send(S, <<"echo ", D500/binary, "\r\n">>),  %% error
     receive
 	{tcp,S,Data1} -> io:format("client got: ~s\n", [Data1])
     after 1000 ->
