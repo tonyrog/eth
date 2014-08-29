@@ -16,6 +16,9 @@
 -export([stop/1, add_ip/3, del_ip/2, find_mac/2, query_mac/2]).
 -export([set_gw/2]).
 
+%% ICMP
+-export([ping/4]).
+
 %% UDP
 -export([udp_open/4, udp_close/2, udp_send/5]).
 %% TCP
@@ -199,6 +202,8 @@
 -define(seq_next(X), ?u32((X)+1)).
 -define(seq_lte(X,Y), (?u32((Y)-(X)) < 16#40000000)).
 -define(seq_lt(X,Y), (?u32((Y)-(X)-1) < 16#40000000)).
+-define(seq_gt(X,Y), (not ?seq_lte((X),(Y)))).
+-define(seq_gte(X,Y), (not ?seq_lt((X),(Y)))).
 
 %%%===================================================================
 %%% API
@@ -213,6 +218,13 @@ start_link(Interface) when is_list(Interface) ->
 
 stop(Net) ->
     gen_server:call(Net, stop).
+
+dump(Net) ->
+    gen_server:call(Net, dump).
+
+%% icmp ping
+ping(Net, ID, SrcIP, DstIP) ->
+    gen_server:call(Net, {ping, ID, SrcIP, DstIP}).
 
 %% udp interface
 udp_open(Net, SrcIP, SrcPort, Options) ->
@@ -337,7 +349,19 @@ init([Interface]) ->
 %%                                   {stop, Reason, State}
 %% @end
 %%--------------------------------------------------------------------
-
+handle_call({ping, ID, SrcIP, DstIP}, _From, State) ->
+    case dict:find(SrcIP, State#state.ipmac) of
+	error ->
+	    {reply, {error, einval}, State};
+	{ok,SrcMac} ->
+	    DstMac = route_lookup(DstIP, State),
+	    Data = <<0:56/unit:8>>,
+	    Icmp = #icmp { type=echo_request, id=ID, seq=0, data=Data},
+	    IP  = #ipv4 { src=SrcIP, dst=DstIP, proto=icmp, data=Icmp },
+	    Eth = #eth { src=SrcMac, dst=DstMac, type=ipv4, data=IP},
+	    transmit_frame(Eth, State),
+	    {reply, ok, State}
+    end;
 handle_call({udp_open,Owner,SrcIP,SrcPort,_Options}, _From, State) ->
     Key = {udp,SrcIP,SrcPort},
     case dict:find(Key, State#state.sockets) of
@@ -388,10 +412,6 @@ handle_call({tcp_listen,Owner,SrcIP,SrcPort,Options}, _From, State) ->
 					   options = Options
 					 },
 		    State1 = add_socket(Socket, State),
-
-		    Sockets = dict:store(Key, Socket, State#state.sockets),
-		    SockRef = dict:store(Ref, Key, State#state.sockref),
-		    State1 =  State#state { sockets=Sockets, sockref=SockRef},
 		    {reply, {ok,Ref}, State1}
 	    end;
 	{ok,_Socket} ->
@@ -405,10 +425,10 @@ handle_call({tcp_accept,LRef,Acceptor}, _From, State) ->
 	{ok,Key={tcp,IP,Port}} ->
 	    AKey = {tcp_a,IP,Port},
 	    Ref = erlang:monitor(process, Acceptor),
-	    Socket = dict:fetch(Key, State#state.sockets),
-	    AQueue = Socket#lst_socket.aqueue ++ [{Ref,Acceptor}],
-	    Socket1 = Socket#lst_socket { aqueue = AQueue },
-	    Sockets = dict:store(Key, Socket1, State#state.sockets),
+	    LSocket = dict:fetch(Key, State#state.sockets),
+	    AQueue = LSocket#lst_socket.aqueue ++ [{Ref,Acceptor}],
+	    LSocket1 = LSocket#lst_socket { aqueue = AQueue },
+	    Sockets = dict:store(Key, LSocket1, State#state.sockets),
 	    SockRef = dict:store(Ref, AKey, State#state.sockref),
 	    State1 = State#state { sockets=Sockets, sockref=SockRef },
 	    {reply, {ok,Ref}, State1};
@@ -537,12 +557,14 @@ handle_call({set_gw,Gw}, _From, State) ->
 		{ok,Mac} ->
 		    {reply, {ok,Mac}, State#state{gw=Gw,gw_mac=Mac}}
 	    end;
-	{ok,Mac} -> 
+	{ok,Mac} ->
 	    {reply, {ok,Mac}, State#state{gw=Gw,gw_mac=Mac}}
     end;
 handle_call(stop, _From, State) ->
     {stop, normal, ok, State};
-
+handle_call(dump, _From, State) ->
+    dump_sockets(State),
+    {reply, ok, State};
 handle_call(_Request, _From, State) ->
     {reply, {error,bad_call}, State}.
 
@@ -786,11 +808,14 @@ handle_tcp(Tcp=#tcp { src_port = SrcPort, dst_port = DstPort },
     Key = {tcp,IP#ipv4.dst,DstPort,IP#ipv4.src,SrcPort},
     case dict:find(Key, State#state.sockets) of
 	error ->
+	    ?debug("session not found: ~w\n", [Key]),
 	    LKey = {tcp,IP#ipv4.dst,DstPort},
+	    
 	    case dict:find(LKey,State#state.sockets) of
 		error ->
-		    ?debug("handle_tcp: not handled: ~s",
-			 [eth_packet:fmt_erl(Tcp)]),
+		    ?debug("handle_tcp: not handled: ip=~w:~w, ~s",
+			   [IP#ipv4.dst,DstPort,eth_packet:fmt_erl(Tcp)]),
+		    %% dump_sockets(State),
 		    %% icmp error?
 		    State;
 		{ok,LSocket} ->
@@ -806,13 +831,12 @@ handle_tcp(Tcp=#tcp { src_port = SrcPort, dst_port = DstPort },
 	{ok,Socket} ->
 	    log_tcp(Socket, Tcp, "<"),
 	    Socket1 = handle_timestamp(Socket, Tcp),
-	    case tcp_fsm(Socket1#tcp_socket.tcp_state,Socket1,
-			 Tcp,IP,Eth,State) of
+	    case tcp_fsm(Socket1#tcp_socket.tcp_state,Socket1,Tcp,State) of
 		false ->
 		    State;
 		undefined ->
 		    ?debug("killing socket ~p", [Socket]),
-		    erase_socket(Socket, State);
+		    erase_socket(Socket1, State);
 		Socket2 ->
 		    store_socket(Socket2, State)
 	    end
@@ -872,7 +896,7 @@ handle_accept(LSocket,Tcp,IP,Eth,State) ->
 %% tcp_fsm - tcp state machine
 %%
 tcp_fsm(?TCP_SYN_RCVD,Socket=#tcp_socket{istream=Istream,ostream=Ostream},
-	Tcp,_IP,_Eth,_State) ->
+	Tcp,_State) ->
     case Tcp of
 	#tcp { seq_no=Seq,ack_no=AckNo,urg=false,ack=true,psh=false,
 	       rst=false,syn=false,fin=false,
@@ -891,7 +915,7 @@ tcp_fsm(?TCP_SYN_RCVD,Socket=#tcp_socket{istream=Istream,ostream=Ostream},
 	    false
     end;
 tcp_fsm(?TCP_SYN_SENT,Socket=#tcp_socket{ istream=Istream, ostream=Ostream },
-	Tcp,_IP,_Eth,State) ->
+	Tcp,State) ->
     case Tcp of
 	#tcp { seq_no=Seq,ack_no=AckNo,urg=false,ack=true,psh=false,
 	       rst=false,syn=true,fin=false,
@@ -911,44 +935,38 @@ tcp_fsm(?TCP_SYN_SENT,Socket=#tcp_socket{ istream=Istream, ostream=Ostream },
 	    false
     end;
 tcp_fsm(?TCP_ESTABLISHED, Socket=#tcp_socket{ istream=Istream,ostream=Ostream },
-	Tcp,_IP,_Eth,State) ->
+	Tcp,State) ->
     case Tcp of
-	#tcp { seq_no=Seq,ack_no=AckNo,urg=false,ack=Ack,psh=_IsPsh,
+	#tcp { seq_no=Seq,ack_no=AckNo,urg=false,ack=Ack,psh=Psh,
 	       rst=false,syn=false,fin=Fin,
-	       window=Wsize,options=_TcpOptions,data=Data } ->
-	    %% fixme: handle SACK
-	    Ostream0 = ack_output_data(Ack, AckNo, Socket, Ostream),
-	    if Seq =:= Istream#stream.seq ->
-		    Len = byte_size(Data),
-		    tcp_report_data(Socket, Data),
-		    TcpState = if Fin -> tcp_report_closed(Socket),
-					 ?TCP_CLOSE_WAIT;
-				  true -> ?TCP_ESTABLISHED
-			       end,
-		    Window = Wsize bsl Istream#stream.wss,
-		    ISeq = if Fin -> ?u32(Seq+Len+1); true -> ?u32(Seq+Len) end,
-		    Istream1 = Istream#stream { closed=Fin,seq=ISeq,blocks=[] },
-		    Ostream1 = Ostream0#stream { window=Window },
-		    Socket1 = Socket#tcp_socket { tcp_state=TcpState,
-						  ostream=Ostream1,
-						  istream=Istream1 },
-		    case transmit_data(Socket1,State) of
-			{false,Socket2} ->
-			    Socket2;
-			{true,Socket2} -> %% we sent FIN in transmit data
-			    TcpState1 =
-				if TcpState =:= ?TCP_CLOSE_WAIT ->
-					?TCP_LAST_ACK;
-				   true -> TcpState
-				end,
-			    Socket2#tcp_socket { tcp_state=TcpState1 }
-		    end;
-	       true ->
-		    %% Ack last known sequence number
-		    io:format("istrem.seq=~w mismatch seq=~w\n",
-			      [Istream#stream.seq, Seq]),
-		    Socket1 = Socket#tcp_socket { ostream=Ostream0 },
-		    send_data(Socket1,State)
+	       window=Wsize,options=TcpOptions,data=Data } ->
+	    Istream0 = insert_segment(Psh, Seq, Data, Istream),
+	    Ostream0 = ack_data(Ack, AckNo, TcpOptions, Socket, Ostream),
+	    Istream1 = deliver_data(Istream0, Socket),
+	    TcpState = if Fin -> tcp_report_closed(Socket),
+				 ?TCP_CLOSE_WAIT;
+			  true -> ?TCP_ESTABLISHED
+		       end,
+	    Window = Wsize bsl Istream#stream.wss,
+	    ISeq = if Fin -> ?u32(Istream1#stream.seq+1);
+		      true -> Istream1#stream.seq
+		   end,
+	    %% fixme: insert Fin packet on the stream block!
+	    Istream2 = Istream#stream { seq=ISeq,closed=Fin },
+	    Ostream1 = Ostream0#stream { window=Window },
+	    Socket1 = Socket#tcp_socket { tcp_state=TcpState,
+					  ostream=Ostream1,
+					  istream=Istream2 },
+	    case transmit_data(Socket1,State) of
+		{false,Socket2} ->
+		    Socket2;
+		{true,Socket2} -> %% we sent FIN in transmit data
+		    TcpState1 =
+			if TcpState =:= ?TCP_CLOSE_WAIT ->
+				?TCP_LAST_ACK;
+			   true -> TcpState
+			end,
+		    Socket2#tcp_socket { tcp_state=TcpState1 }
 	    end;
 	_ ->
 	    ?debug("tcp_fsm(established): tcp dropped:\n~s\n",
@@ -956,14 +974,13 @@ tcp_fsm(?TCP_ESTABLISHED, Socket=#tcp_socket{ istream=Istream,ostream=Ostream },
 	    false
     end;
 tcp_fsm(?TCP_FIN_WAIT1, Socket=#tcp_socket{ istream=Istream, ostream=Ostream},
-	Tcp,_IP,_Eth,State) ->
+	Tcp,State) ->
     case Tcp of
-	#tcp { seq_no=Seq,ack_no=AckNo,urg=false,ack=Ack,psh=_IsPsh,
+	#tcp { seq_no=Seq,ack_no=AckNo,urg=false,ack=Ack,psh=Psh,
 	       rst=false,syn=false,fin=Fin,
-	       window=_Wsize,options=_Options,data=Data } ->
-	    Ostream1 = ack_output_data(Ack, AckNo, Socket, Ostream),
-	    %% we must stay in FIN_WAIT1 until Ostream1.close /= true
-	    %% that is until the FIN is acknowledged.
+	       window=_Wsize,options=TcpOptions,data=Data } ->
+	    Istream0 = insert_segment(Psh, Seq, Data, Istream),
+	    Ostream1 = ack_data(Ack, AckNo, TcpOptions, Socket, Ostream),
 	    OutFinAck = Ostream1#stream.closed =:= true,
 	    TcpState =
 		if Fin,OutFinAck -> start_msl_timer(Socket), ?TCP_TIME_WAIT;
@@ -971,26 +988,18 @@ tcp_fsm(?TCP_FIN_WAIT1, Socket=#tcp_socket{ istream=Istream, ostream=Ostream},
 		   OutFinAck -> ?TCP_FIN_WAIT2;
 		   true -> ?TCP_FIN_WAIT1
 		end,
-	    Socket1 = if Seq =:= Istream#stream.seq ->
-			      Len = byte_size(Data),
-			      tcp_report_data(Socket, Data),
-			      tcp_report_closed(Socket,Fin),
-			      ISeq = if Fin -> ?u32(Seq+Len+1);
-					true -> ?u32(Seq+Len) end,
-			      Istream1 = Istream#stream { seq=ISeq,closed=Fin,
-							  blocks=[] },
-			      Socket#tcp_socket { tcp_state=TcpState,
-						  ostream=Ostream1,
-						  istream=Istream1 };
-			 true ->
-			      %% lost packet - retransmit?
-			      io:format("seq not matched ~w != ~w\n",
-					[Seq, Istream#stream.seq]),
-			      Socket#tcp_socket { tcp_state=TcpState,
-						  ostream=Ostream1 }
-		      end,
+	    Istream1 = deliver_data(Istream0, Socket),
+	    tcp_report_closed(Socket,Fin),
+	    %% fixme: insert Fin packet on the stream block!
+	    ISeq = if Fin -> ?u32(Istream1#stream.seq+1);
+		      true -> Istream1#stream.seq
+		   end,
+	    Istream2 = Istream1#stream { seq=ISeq,closed=Fin },
+	    Socket1 = Socket#tcp_socket { tcp_state=TcpState,
+					  ostream=Ostream1,
+					  istream=Istream2 },
 	    if TcpState =:= ?TCP_FIN_WAIT2 ->
-		    Socket1; %% wait for FIN
+		    Socket1;
 	       true ->
 		    transmit_ack(Socket1,State)
 	    end;
@@ -1000,7 +1009,7 @@ tcp_fsm(?TCP_FIN_WAIT1, Socket=#tcp_socket{ istream=Istream, ostream=Ostream},
 	    false
     end;
 tcp_fsm(?TCP_FIN_WAIT2,Socket=#tcp_socket{istream=Istream},
-	Tcp,_IP,_Eth,State) ->
+	Tcp,State) ->
     case Tcp of
 	#tcp { seq_no=Seq,ack_no=_AckNo,urg=false,ack=_Ack,psh=_IsPsh,
 	       rst=false,syn=false,fin=true,
@@ -1027,12 +1036,12 @@ tcp_fsm(?TCP_FIN_WAIT2,Socket=#tcp_socket{istream=Istream},
 	    false
     end;
 tcp_fsm(?TCP_CLOSING,Socket=#tcp_socket{ostream=Ostream},
-	Tcp,_IP,_Eth,_State) ->
+	Tcp,_State) ->
     case Tcp of
 	#tcp { seq_no=_Seq,ack_no=AckNo,urg=false,ack=Ack,psh=false,
 	       rst=false,syn=false,fin=_Fin,
-	       window=_Wsize,options=_Options,data= <<>> } ->
-	    Ostream1 = ack_output_data(Ack, AckNo, Socket, Ostream),
+	       window=_Wsize,options=TcpOptions,data= <<>> } ->
+	    Ostream1 = ack_data(Ack, AckNo, TcpOptions, Socket, Ostream),
 	    OutFinAck = Ostream1#stream.closed =:= true,
 	    if OutFinAck ->
 		    Socket#tcp_socket { tcp_state = ?TCP_TIME_WAIT,
@@ -1044,12 +1053,12 @@ tcp_fsm(?TCP_CLOSING,Socket=#tcp_socket{ostream=Ostream},
 	    end
     end;
 tcp_fsm(?TCP_TIME_WAIT,#tcp_socket{ostream=Ostream},
-	Tcp,_IP,_Eth,_State) ->
+	Tcp,_State) ->
     ?debug("tcp_fsm(time_wait): (seq=~w) tcp dropped:\n~s\n",
 	 [Ostream#stream.seq, eth_packet:fmt_erl(Tcp)]),
     false;
 tcp_fsm(?TCP_CLOSE_WAIT,Socket=#tcp_socket{ostream=Ostream},
-	Tcp,_IP,_Eth,State) ->
+	Tcp,State) ->
     case Tcp of
 	#tcp { seq_no=_Seq,ack_no=AckNo,urg=false,ack=true,psh=false,
 	       rst=false,syn=false,fin=_Fin,
@@ -1066,7 +1075,7 @@ tcp_fsm(?TCP_CLOSE_WAIT,Socket=#tcp_socket{ostream=Ostream},
 	    false
     end;
 tcp_fsm(?TCP_LAST_ACK,_Socket=#tcp_socket{ostream=Ostream},
-	Tcp,_IP,_Eth,_State) ->
+	Tcp,_State) ->
     case Tcp of
 	#tcp { seq_no=_Seq,ack_no=AckNo,urg=false,ack=true,psh=false,
 	       rst=false,syn=false,fin=false,
@@ -1078,7 +1087,7 @@ tcp_fsm(?TCP_LAST_ACK,_Socket=#tcp_socket{ostream=Ostream},
 		 [Ostream#stream.seq, eth_packet:fmt_erl(Tcp)]),
 	    false
     end;
-tcp_fsm(TcpState,Socket,Tcp,_IP,_Eth,_State) ->
+tcp_fsm(TcpState,Socket,Tcp,_State) ->
     ?debug("tcp_fsm(~s): (seq=~w) not handled:\n~s\n",
 	 [TcpState,(Socket#tcp_socket.ostream)#stream.seq,
 	  eth_packet:fmt_erl(Tcp)]),
@@ -1141,10 +1150,59 @@ handle_arp(Arp,_Eth,State) ->
     ?debug("handle_arp: not handled: ~p", [Arp]),
     State.
 
+%% deliver ready data to the socket owner
+deliver_data(Stream, Socket) ->
+    deliver_blocks(Stream#stream.blocks, Socket, Stream).
+
+deliver_blocks([#block { seq=Seq,data=Data}|Bs],Socket,Stream)
+  when Seq =:= Stream#stream.seq ->
+    tcp_report_data(Socket, Data),
+    Len = byte_size(Data),
+    deliver_blocks(Bs, Socket, Stream#stream { seq=?u32(Seq+Len) });
+deliver_blocks(Bs, _Socket, Stream) ->
+    Stream#stream { blocks = Bs }.
+
+%% insert segment data in input buffer
+insert_segment(_Psh, _Seq, <<>>, Stream) ->
+    Stream;
+insert_segment(Psh, Seq, Data, Stream) ->
+    case Stream#stream.blocks of
+	[#block{seq=Seq}|_] ->
+	    Stream;
+	[] ->
+	    Bs1 = [#block{seq=Seq,status=Psh,data=Data}],
+	    Stream#stream { blocks=Bs1 };
+	Bs ->
+	    case ?seq_gt(Seq, Stream#stream.seq) of
+		true ->
+		    Bs1 = insert_segment_block(Psh,Seq,Data,Bs),
+		    Stream#stream { blocks=Bs1 };
+		false ->
+		    Stream
+	    end
+    end.
+
+%% a lot of fixme: check that retransmitted blocks are the same
+%% check overlaps etc.
+insert_segment_block(Psh,Seq,Data,Bs0=[B|Bs]) ->
+    case ?seq_gt(Seq, B#block.seq) of
+	true ->
+	    [B|insert_segment_block(Psh,Seq,Data,Bs)];
+	false ->
+	    if Seq =:= B#block.seq -> %% assume retransmit, fixme check!
+		    Bs0;
+	       true ->
+		    [#block{seq=Seq,status=Psh,data=Data}|Bs0]
+	    end
+    end;
+insert_segment_block(Psh,Seq,Data,[]) ->
+    [#block{seq=Seq,status=Psh,data=Data}].
+
+
 %% Handle ack of output data (fixme handle sack)
-ack_output_data(true,AckNo,Socket,Ostream) ->
+ack_data(true,AckNo,_TcpOptions,Socket,Ostream) ->
     ack_blocks(Ostream#stream.blocks,AckNo,Socket,Ostream);
-ack_output_data(false,_AckNo,_Socket,Ostream) ->
+ack_data(false,_AckNo,_TcpOptions,_Socket,Ostream) ->
     Ostream.
 
 ack_blocks(Bs0=[#block{seq=Seq,data=Data}|Bs],AckNo,Socket,Stream) ->
@@ -1623,7 +1681,7 @@ insert_cache({0,0,0,0}, _, State) -> State;
 insert_cache({0,0,0,0,0,0,0,0}, _, State) -> State;
 insert_cache(IP, Mac, State) ->
     IPMac = dict:store(IP, Mac, State#state.cache),
-    GwMac = if State#state.gw =:= IP -> 
+    GwMac = if State#state.gw =:= IP ->
 		    io:format("gateway ~w mac set = ~w\n", [IP,Mac]),
 		    Mac;
 	       true -> State#state.gw_mac
@@ -1677,6 +1735,43 @@ log_tcp(TcpState,Src,SrcPort,Dst,DstPort,Tcp,Dir) ->
 	       Tcp#tcp.ack_no,
 	       Tcp#tcp.options,
 	       format_tcp_data(Tcp#tcp.data, 64)]).
+
+dump_sockets(State) ->
+    io:format("--- REF TABLE ---\n"),
+    dict:fold(
+      fun(Ref,Key,_) -> io:format("~w -> ~w\n", [Ref,Key]) end,
+      ok, State#state.sockref),
+    io:format("--- SOCKET TABLE ---\n"),
+    dict:fold(
+      fun(_Key,Socket,_) when is_record(Socket,lst_socket) ->
+	      io:format("~w: src=~s:~w options=~w\n", 
+			[Socket#lst_socket.key,
+			 format_ip_addr(Socket#lst_socket.src),
+			 Socket#lst_socket.src_port,
+			 Socket#lst_socket.options
+			]);
+	 (_Key,Socket,_) when is_record(Socket,tcp_socket) ->
+	      io:format("~w: [~w] src=~s:~w dst=~s:~w rto=~w\n",
+			[Socket#tcp_socket.key,
+			 Socket#tcp_socket.tcp_state,
+			 format_ip_addr(Socket#tcp_socket.src),
+			 Socket#tcp_socket.src_port,
+			 format_ip_addr(Socket#tcp_socket.dst),
+			 Socket#tcp_socket.dst_port,
+			 Socket#tcp_socket.rto
+			]);
+	 (_Key,Socket,_) when is_record(Socket,udp_socket) ->
+	      io:format("~w: [udp] src=~s:~w dst=~s:~w\n", 
+			[Socket#udp_socket.key,
+			 format_ip_addr(Socket#udp_socket.src),
+			 Socket#udp_socket.src_port,
+			 format_ip_addr(Socket#udp_socket.dst),
+			 Socket#udp_socket.dst_port
+			])
+      end, ok, State#state.sockets),
+    io:format("--- END ---\n").
+
+
 
 format_ip_addr({A,B,C,D}) ->
     io_lib:format("~w.~w.~w.~w", [A,B,C,D]);

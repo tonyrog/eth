@@ -1,0 +1,21 @@
+
+mac os x:
+Bridge two interface en1 and tap0
+=================================
+ifconfig bridge0 create
+ifconfig bridge0 up
+ifconfig bridge0 addm en1 addm tap0
+sysctl -w net.inet.ip.forwarding=1
+
+Nat traffic from tap0 towards gateway
+=====================================
+gwdev=en1
+dev=tap0
+ifconfig bridge0 create
+ifconfig bridge0 up
+ifconfig bridge0 addm $dev
+ifconfig bridge0 192.168.10.1
+sysctl -w net.inet.ip.forwarding=1
+/sbin/ipfw add 100 divert natd ip from any to any via $gwdev
+/usr/sbin/natd -interface $gwdev -use_sockets -same_ports -unregistered_only -dynamic -clamp_mss -enable_natportmap -natportmap_interface $dev
+
