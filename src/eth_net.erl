@@ -257,9 +257,9 @@ tcp_connect(Net, SrcIP, SrcPort, DstIP, DstPort, Options) ->
 
 %% send binary data or if a list of binaries, send each binary as
 %% one or more segments.
-tcp_send(Net, TcpRef, Data) when ?is_block(Data);
-				 ?is_block(hd(Data)) ->
-    gen_server:call(Net, {tcp_send, TcpRef, Data}).
+tcp_send(Net, Ref, Data) when ?is_block(Data);
+			      ?is_block(hd(Data)) ->
+    gen_server:call(Net, {tcp_send, Ref, Data}).
 
 %% send FIN and terminate gracefully
 tcp_shutdown(Net, TcpRef) ->
