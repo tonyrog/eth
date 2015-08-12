@@ -14,7 +14,7 @@
 -export([start_link/0]).
 -export([open/1, close/1, find/1, debug/2]).
 -export([set_filter/3, get_address/1]).
--export([get_list/0, i/0]).
+-export([get_list/0, scan_list/0, i/0]).
 -export([send/2]).
 -export([get_stat/1]).
 -export([get_name/1]).
@@ -116,6 +116,12 @@ get_list() ->
     gen_server:call(?SERVER, get_list).
 
 %% @doc
+%%   Re-scane the interface list
+%% @end
+scan_list() ->
+    gen_server:call(?SERVER, scan_list).
+
+%% @doc
 %%   Get interface filter statitics 
 %% @end
 get_stat(Interface) when is_list(Interface) ->
@@ -213,12 +219,7 @@ init([]) ->
     {ok,IFs} = inet:getifaddrs(),
     %% fixme: subscriber to netlink events, when interfaces are
     %% added and removed!
-    Ds = [#device { name=Name,
-		    hwaddr=case proplists:get_value(hwaddr,Fs,"") of
-			       [A,B,C,D,E,F] -> {A,B,C,D,E,F};
-			       _ -> undefined
-			   end
-		  } || {Name,Fs} <- IFs ],
+    Ds = [#device { name=Name, hwaddr=get_hwaddr(Fs) } || {Name,Fs} <- IFs ],
     {ok, #state{ devices = Ds }}.
 
 %%--------------------------------------------------------------------
@@ -344,6 +345,24 @@ handle_call(get_list, _From, State) ->
     {reply, [{Name,Addr,Port} || 
 		#device { name=Name, hwaddr=Addr, port=Port} <- 
 		    State#state.devices], State};
+handle_call(scan_list, _From, State) ->
+    {ok,IFs} = inet:getifaddrs(),
+    Ds1 = 
+	lists:foldl(
+	  fun({Name,Fs}, Ds) ->
+		  HwAddr = get_hwaddr(Fs),
+		  case lists:keytake(Name, #device.name, Ds) of
+		      {value,D,Ds1} ->
+			  if D#device.hwaddr =:= HwAddr ->
+				  Ds;
+			     true ->
+				  [D#device { hwaddr = HwAddr } | Ds1]
+			  end;
+		      false ->
+			  [#device { name=Name, hwaddr=HwAddr} | Ds]
+		  end
+	  end, State#state.devices, IFs),
+    {reply, ok, State#state{ devices = Ds1 }};
 
 handle_call(_Request, _From, State) ->
     {reply, {error, bad_call}, State}.
@@ -436,6 +455,13 @@ code_change(_OldVsn, State, _Extra) ->
 %%%===================================================================
 %%% Internal functions
 %%%===================================================================
+
+%% get hw address from property list
+get_hwaddr(Fs) ->
+    case proplists:get_value(hwaddr,Fs,"") of
+	[A,B,C,D,E,F] -> {A,B,C,D,E,F};
+	_ -> undefined
+    end.
 
 port_call(Port, Cmd, Data) ->
     case erlang:port_control(Port, Cmd, Data) of

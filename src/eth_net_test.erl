@@ -146,7 +146,7 @@ setup(Type) ->
 setup(_, Tap, ip) ->
     inet:ifset(Tap, [{addr,{192,168,10,1}}, {flags,[up]}]);
 setup({_,darwin}, Tap, gw) ->
-    Bridge = "bridge0",
+    Bridge = "bridge1",
     command(["ifconfig", Bridge, "addm",Tap]).
 
 command(Args) ->
@@ -176,7 +176,7 @@ tcp_accept(Net) ->
 tcp_connect(Net) ->
     eth_net:query_mac(Net, {192,168,10,1}), %% force caching
     timer:sleep(100),
-    random:seed(erlang:now()),
+    random:seed(os:timestamp()),
     SrcPort = 57000 + random:uniform(1000),  %% fixme!
     {ok,S} = eth_net:tcp_connect(Net,
 				 {192,168,10,10},SrcPort,
@@ -186,7 +186,7 @@ tcp_connect(Net) ->
     eth_tcp_server(Net, undefined, S).
 
 http_download(Net,Dst,DstPort,Path,Fd) ->
-    random:seed(erlang:now()),
+    random:seed(os:timestamp()),
     SrcPort = 57000 + random:uniform(1000),  %% fixme!
     {ok,S} = eth_net:tcp_connect(Net,{192,168,10,10},SrcPort,
 				 Dst,DstPort,[{mss,?TEST_MSS},
