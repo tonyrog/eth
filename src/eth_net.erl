@@ -1541,7 +1541,7 @@ route_lookup(Dst, State) ->
     end.
 
 random_32() ->
-    <<X:32>> = crypto:rand_bytes(4),
+    <<X:32>> = crypto:strong_rand_bytes(4),
     X.
 
 default_mss(IP,State) when tuple_size(IP) =:= 4 -> State#state.mssdflt;

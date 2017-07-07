@@ -7,7 +7,7 @@
 
 -module(eth_net_test).
 
--export([setup/0,setup/1]).
+-export([setup/0]).
 -export([init/0]).
 -export([udp/1]).
 -export([tcp_accept/1]).
@@ -32,13 +32,23 @@
 %%
 %%  <ext> = en0 | en1 | eth0 ..
 %%  <tap> = tap0 ...
-%% macosx:
+%% macosx 10.9 and earlier:
+%%    sudo sysctl -w net.inet.ip.forwarding=1
 %%    /usr/sbin/natd -interface <ext>
 %%    /sbin/ipfw -f flush
 %%    /sbin/ipfw add divert natd all from any to any via <ext>
 %%    /sbin/ipfw add pass all from any to any
-%%    sudo sysctl -w net.inet.ip.forwarding=1
 %%
+%% macosx 10.10
+%%    sudo sysctl -w net.inet.ip.forwarding=1
+%%    pfrule:
+%%      "nat on en0 from tap0:network to any -> (en0)
+%%      pass inet proto icmp all
+%%      pass in on tap0 proto udp from any to any port domain keep state
+%%      pass quick on en0 proto udp from any to any port domain keep state"
+%%      > /tmp/pfrule
+%%      sudo pfctl -e
+%%      sudo pfctl -f /tmp/pfrule
 %%
 %% linux:
 %%     iptables -A FORWARD -i eth0 -o tap0 -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT
@@ -51,12 +61,12 @@
 
 %% run as root!
 test1() ->
-    setup(ip),
+    setup(),
     Net = init(),
     tcp_accept(Net).
 
 test2() ->
-    setup(ip),
+    setup(),
     Net = init(),
     {ok,L} = gen_tcp:listen(6668, [{ifaddr,{192,168,10,1}},
 				   {mode,binary},
@@ -85,7 +95,7 @@ test_www(Host,Path) ->
     test_www(Host,80,Path).
 
 test_www(Host,Port,Path) ->
-    setup(gw),
+    setup(),
     Net = init(),
     run_www(Net,Host,Port,Path).
 
@@ -127,15 +137,16 @@ test_gen_server(L) ->
 
 
 %% run once to setup tap device
-setup() -> setup(ip).
-setup(Type) ->
+setup() ->
     application:ensure_all_started(eth),
     case eth_devices:find("tap0") of
 	{error,enoent} -> %% fixme: eth_device should handle this better?
 	    case eth_devices:open("tap") of
 		{ok,Port} ->
 		    {ok,Tap} = eth_devices:get_name(Port),
-		    setup(os:type(),Tap,Type);
+		    OsType = os:type(),
+		    setup(OsType, Tap, ip),
+		    setup(os:type(),Tap, gw);
 		Error ->
 		    Error
 	    end;
@@ -143,17 +154,47 @@ setup(Type) ->
 	    ok
     end.
 
-setup(_, Tap, ip) ->
-    inet:ifset(Tap, [{addr,{192,168,10,1}}, {flags,[up]}]);
-setup({_,darwin}, Tap, gw) ->
+setup(OsType, Tap, ip) ->
+    inet:ifset(Tap, [{addr,{192,168,10,1}}, {flags,[up]}]),
+    nat(OsType, os:version(), Tap);
+setup(_OsType={_,darwin}, Tap, gw) ->
     Bridge = "bridge1",
-    command(["ifconfig", Bridge, "addm",Tap]).
+    command(["ifconfig", Bridge, "addm",Tap]);
+setup(_OsType, _Tap, _) ->
+    ok.
+
+
+
+
+nat({_,darwin}, {Major,_,_}, Tap) when Major >= 14 ->
+    TapName = list_to_binary(Tap),
+    %% using pfctl
+    file:write_file("/tmp/pfrule",
+		    <<"nat on en0 from ", TapName/binary, ":network to any -> (en0)\npass inet proto icmp all\npass in on ", TapName/binary, " proto udp from any to any port domain keep state\npass quick on en0 proto udp from any to any port domain keep state\n">>),
+    command(["sysctl -w net.inet.ip.forwarding=1"]),
+    command(["pfctl -e"]),
+    command(["pfctl -f /tmp/pfrule"]);
+nat({_,darwin}, {Major,_,_}, _Tap) when Major < 14 ->
+    command(["sysctl -w net.inet.ip.forwarding=1"]),
+    command(["/sbin/ipfw -f flush"]),
+    command(["/sbin/ipfw add divert natd all from any to any via en0"]),
+    command(["/sbin/ipfw add pass all from any to any"]);
+nat({_,linux}, _Verion, Tap) ->
+    command(["sysctl -w net.ipv4.ip_forward=1"]),
+    command(["iptables -A FORWARD -i eth0 -o ", Tap, " -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT"]),
+    command(["iptables -A FORWARD -i ",Tap," -o ",Tap," -m state --state ESTABLISHED,RELATED -j ACCEPT"]),
+    command(["iptables -t nat -A POSTROUTING -o eth0 -j SNAT --to 192.168.1.1"]);
+nat(_, _, _) ->
+    ok.
+
 
 command(Args) ->
     Command = string:join(Args, " "),
     io:format("execute: ~s\n", [Command]),
     R = os:cmd(Command),
-    io:format("result: ~s\n", [R]).
+    io:format("result: ~s\n", [R]),
+    R.
+
 
 %% run this to start | when net crashed.
 init() ->
