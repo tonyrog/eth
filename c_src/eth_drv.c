@@ -146,9 +146,6 @@ static int  eth_drv_init(void);
 static void eth_drv_finish(void);
 static void eth_drv_stop(ErlDrvData);
 static void eth_drv_output(ErlDrvData, char*, ErlDrvSizeT);
-#if 0
-static void eth_drv_outputv(ErlDrvData d, ErlIOVec *ev);
-#endif
 static void eth_drv_ready_input(ErlDrvData, ErlDrvEvent);
 static void eth_drv_ready_output(ErlDrvData data, ErlDrvEvent event);
 static ErlDrvData eth_drv_start(ErlDrvPort, char* command);
@@ -1039,26 +1036,6 @@ static void eth_drv_output(ErlDrvData d, char* buf, ErlDrvSizeT len)
     }
 }
 
-#if 0
-static void eth_drv_outputv(ErlDrvData d, ErlIOVec *ev)
-{
-    (void) d;
-    (void) ev;
-//  eth_ctx_t*   ctx = (eth_ctx_t*) d;
-    DEBUGF("eth_drv: outputv");
-}
-#endif
-
-static void eth_drv_event(ErlDrvData d, ErlDrvEvent e,
-				  ErlDrvEventData ed)
-{
-    (void) d;
-    (void) e;
-    (void) ed;
-//  eth_ctx_t* ctx = (eth_ctx_t*) d;
-    DEBUGF("eth_drv: event called");
-}
-
 static void eth_drv_ready_input(ErlDrvData d, ErlDrvEvent e)
 {
     eth_ctx_t* ctx = (eth_ctx_t*) d;
@@ -1121,7 +1098,8 @@ DRIVER_INIT(eth_drv)
     ErlDrvEntry* ptr = &eth_drv_entry;
 
     DEBUGF("eth DRIVER_INIT");
-
+    
+    memset(ptr, 0, sizeof(ErlDrvEntry));
     ptr->driver_name = "eth_drv";
     ptr->init  = eth_drv_init;
     ptr->start = eth_drv_start;
@@ -1132,11 +1110,6 @@ DRIVER_INIT(eth_drv)
     ptr->finish = eth_drv_finish;
     ptr->control = eth_drv_ctl;
     ptr->timeout = eth_drv_timeout;
-    ptr->outputv = NULL; // eth_drv_outputv;
-    ptr->ready_async = 0;
-    ptr->flush = 0;
-    ptr->call = 0;
-    ptr->event = eth_drv_event;
     ptr->extended_marker = ERL_DRV_EXTENDED_MARKER;
     ptr->major_version = ERL_DRV_EXTENDED_MAJOR_VERSION;
     ptr->minor_version = ERL_DRV_EXTENDED_MINOR_VERSION;
