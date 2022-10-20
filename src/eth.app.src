@@ -1,6 +1,8 @@
+%% -*- erlang -*-
 {application, eth,
  [{description, "Ethernet device controller"},
   {vsn, git},
+  {modules, ["@@MODULES@@"]},
   {mod, {eth_app, []}},
   {registered, [eth_devices]},
   {env, []},

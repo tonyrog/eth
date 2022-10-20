@@ -286,8 +286,8 @@ uint32_t eth_bpf_exec(uint8_t* ptr, size_t n, uint8_t* p, uint32_t len,
 {
     bpf_insn_t* insns = (bpf_insn_t*) ptr;
     register uint32_t pc = 0;
-    register uint32_t a;
-    register uint32_t x;
+    register uint32_t a = 0;
+    register uint32_t x = 0;
     uint32_t mem[BPF_MEMWORDS];
 
     *err = ETH_BPF_OK;

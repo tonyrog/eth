@@ -21,10 +21,10 @@
 #include <linux/if.h>
 #include <linux/if_tun.h>
 #include <sys/ioctl.h>
+#include <asm-generic/socket.h>  // what??
 #include <linux/filter.h>
 
 #elif defined(__APPLE__)
-#include <fcntl.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/time.h>
@@ -489,7 +489,7 @@ static int setup_input_buffer(eth_ctx_t* ctx)
 
 static int alloc_input_buffer(eth_ctx_t* ctx)
 {
-    uint buflen;
+    size_t buflen;
     if (ctx->is_tap)
 	buflen = ctx->ibuflen;
     else {
@@ -502,7 +502,7 @@ static int alloc_input_buffer(eth_ctx_t* ctx)
 	buflen = ctx->ibuflen;
 #endif
     }
-    DEBUGF("alloc_input_buffer: size=%d", buflen);
+    DEBUGF("alloc_input_buffer: size=%ld", buflen);
     ctx->ibuf = driver_alloc(buflen);
     ctx->ibuflen = buflen;
     return 0;

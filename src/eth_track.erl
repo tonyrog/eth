@@ -17,6 +17,7 @@
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
 	 terminate/2, code_change/3]).
 
+-include_lib("kernel/include/inet.hrl").
 -include_lib("enet/include/enet_types.hrl").
 
 -record(state, 
@@ -140,6 +141,7 @@ handle_info({eth_frame,_Port,_IfIndex,Data}, State) ->
 	    if Tcp#tcp.syn, Tcp#tcp.ack ->
 		    Key = {IPv4#ipv4.src, IPv4#ipv4.dst,
 			   Tcp#tcp.src_port, Tcp#tcp.dst_port},
+		    show_syn_ack(Key),
 		    ets:insert(State#state.con, {Key,true});
 	       Tcp#tcp.fin, Tcp#tcp.ack; Tcp#tcp.rst ->
 		    Key = {IPv4#ipv4.src, IPv4#ipv4.dst,
@@ -150,9 +152,9 @@ handle_info({eth_frame,_Port,_IfIndex,Data}, State) ->
 	    end,
 	    {noreply, State}
     catch
-	error:Reason ->
+	error:Reason:Stack ->
 	    io:format("crash: ~p\n  ~p\n",
-		      [Reason,erlang:get_stacktrace()]),
+		      [Reason,Stack]),
 	    {noreply, State}
     end;
 handle_info(_Info, State) ->
@@ -186,6 +188,18 @@ code_change(_OldVsn, State, _Extra) ->
 %%%===================================================================
 %%% Internal functions
 %%%===================================================================
+
+show_syn_ack({Src, Dst, SrcPort, DstPort}) ->
+    case inet:gethostbyaddr(Src) of
+	{ok,HEnt} ->
+	    io:format("connected to: ~s:~w from ~s:~w\n",
+		      [HEnt#hostent.h_name, SrcPort,
+		       inet:ntoa(Dst), DstPort]);
+	{error,_} ->
+	    io:format("connected to: ~s:~w from ~s:~w\n",
+		      [inet:ntoa(Src), SrcPort,
+		       inet:ntoa(Dst), DstPort])
+    end.
 
 %% TCP - SYN/ACK => established
 connect_filter() ->

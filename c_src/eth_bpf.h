@@ -5,6 +5,8 @@
 #ifndef __ETH_BPF_H__
 #define __ETH_BPF_H__
 
+#include <stdint.h>
+
 #define ETH_BPF_OK                         0
 #define ETH_BPF_PC_OUT_OF_RANGE            1
 #define ETH_BPF_PACKET_INDEX_OUT_OF_RANGE  2

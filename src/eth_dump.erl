@@ -191,14 +191,12 @@ handle_info({eth_frame,_Port,_IfIndex,Data}, State) ->
 	    try dump(Eth, State#state.style) of
 		ok -> ok
 	    catch
-		error:Reason ->
-		    io:format("crash: ~p\n  ~p\n", 
-			      [Reason,erlang:get_stacktrace()])
+		error:Reason:Stack ->
+		    io:format("crash: ~p\n  ~p\n", [Reason,Stack])
 	    end
     catch
-	error:Reason ->
-	    io:format("crash: ~p\n  ~p\n",
-		      [Reason,erlang:get_stacktrace()])
+	error:Reason:Stack ->
+	    io:format("crash: ~p\n  ~p\n", [Reason,Stack])
     end,
     {noreply, State};
 handle_info({timeout,TRef, deactivate}, State) when TRef =:= State#state.tref ->
